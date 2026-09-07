@@ -38,13 +38,15 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
 
     $tagline = match ($audience) {
         'customer' => '',
-        'guest'    => 'Staff sign-in. Credentials collected here are encrypted, kept as the customer asked, and purged on expiry.',
+        'guest'    => '',
         default    => 'Internal tool. Encrypted at rest, kept as the customer asked, purged on expiry.',
     };
 
-    $h1 = $audience === 'customer'
-        ? 'InstaWP <span class="sub">send credentials securely</span>'
-        : 'InstaWP <span class="sub">secure credential handoff</span>';
+    $h1 = match ($audience) {
+        'customer' => 'InstaWP <span class="sub">send credentials securely</span>',
+        'guest'    => 'InstaWP <span class="sub">secure credential handoff</span>',
+        default    => 'InstaWP <span class="sub">secure credential handoff</span>',
+    };
     $brandInner = '
         <span class="mark" aria-hidden="true">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2"
@@ -60,7 +62,7 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
 
     $foot = match ($audience) {
         'customer' => '<footer class="foot">Encrypted in transit and at rest · You choose how long we keep them</footer>',
-        'guest'    => '<footer class="foot">Staff only · No customer accounts on this page</footer>',
+        'guest'    => '<footer class="foot">Staff only · Customer links do not use this page</footer>',
         default    => '',
     };
 
@@ -113,14 +115,35 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
       radial-gradient(720px 280px at 50% -40px, color-mix(in srgb, var(--mint) 16%, transparent), transparent 70%),
       var(--bg);
   }
+  body.aud-guest{
+    display:flex;flex-direction:column;justify-content:center;min-height:100vh;
+    background:
+      radial-gradient(900px 420px at 50% -120px, color-mix(in srgb, var(--mint) 22%, transparent), transparent 68%),
+      radial-gradient(520px 280px at 100% 100%, color-mix(in srgb, var(--brand) 10%, transparent), transparent 70%),
+      var(--bg);
+  }
   .skip{position:absolute;left:-999px;top:8px;z-index:9;padding:8px 12px;background:var(--brand);color:#fff;border-radius:8px}
   .skip:focus{left:12px}
   .chrome,.wrap{max-width:1040px;margin:0 auto;padding:0 20px}
   .wrap{padding-top:24px;padding-bottom:72px}
   body.aud-customer .chrome,body.aud-customer .wrap{max-width:840px}
-  body.aud-guest .chrome,body.aud-guest .wrap{max-width:520px}
-  body.aud-guest .wrap{padding-top:0}
-  body.aud-guest header.top{padding-top:8vh}
+  body.aud-guest .chrome,body.aud-guest .wrap{max-width:400px;width:100%}
+  body.aud-guest .wrap{padding:20px 20px 32px;flex:0 0 auto}
+  body.aud-guest header.top{padding:0;border:0;margin:0;background:transparent;flex:0 0 auto}
+  body.aud-guest header.top .chrome{padding:24px 20px 0}
+  body.aud-guest .brandrow{justify-content:center}
+  body.aud-guest .brand{flex-direction:column;align-items:center;text-align:center;gap:14px}
+  body.aud-guest .mark{width:48px;height:48px;border-radius:14px}
+  body.aud-guest .mark svg{width:20px;height:20px}
+  body.aud-guest h1{font-size:22px;letter-spacing:-.03em}
+  body.aud-guest h1 .sub{font-size:13.5px;margin-top:4px}
+  body.aud-guest .card{margin:0;padding:26px 24px 22px}
+  body.aud-guest .card h2{font-size:18px;margin:0 0 4px;text-align:center}
+  body.aud-guest .card .lede{text-align:center;margin:0 0 18px}
+  body.aud-guest .field{margin:0 0 12px}
+  body.aud-guest .btn-row{margin-top:16px}
+  body.aud-guest .foot{margin:18px 0 0;padding-top:0;border:0}
+  body.aud-guest main > .box{margin:0 0 12px}
   body.aud-customer header.top{padding-top:20px}
   body.aud-customer .tagline{margin-top:8px}
   body.aud-customer h2{font-size:18px;margin-bottom:6px}
@@ -159,8 +182,11 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
         border:0;background:transparent;font:inherit;font-size:13px;cursor:pointer}
   nav a:hover{background:var(--panel);color:var(--brand)}
   nav a.on{background:var(--panel);color:var(--brand-900);box-shadow:0 1px 2px rgba(2,44,34,.06)}
-  .nav-quit{color:var(--mut);font-weight:600;font-size:13px;padding:6px 8px;border:0;background:transparent;cursor:pointer;font:inherit}
-  .nav-quit:hover{color:var(--dang)}
+  .nav-quit{color:var(--mut);font-weight:600;font-size:13px;padding:6px 8px;border:0;background:transparent;
+        box-shadow:none;cursor:pointer;font:inherit}
+  .nav-quit:hover,.nav-quit:active,.nav-quit:focus-visible{
+        background:transparent;color:var(--brand-900);box-shadow:none;transform:none;filter:none}
+  .nav-quit:focus-visible{outline:2px solid var(--mint);outline-offset:2px}
   a{color:var(--acc)}
   a:focus-visible{outline:2px solid var(--mint);outline-offset:2px;border-radius:4px}
   .mut{color:var(--mut);font-size:13px}

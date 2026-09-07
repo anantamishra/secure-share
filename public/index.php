@@ -221,7 +221,7 @@ if ($path === '/login') {
     echo layout('Sign in', ($err ?? '') . '
         <div class="card">
           <h2>Sign in</h2>
-          <p class="lede">Staff only. Customer links do not use this page.</p>
+          <p class="lede">Use your staff email and password.</p>
           <form method="post">
             <input type="hidden" name="csrf" value="' . h(csrf_token()) . '">
             <div class="field">
