@@ -82,6 +82,24 @@ function staff_logout(): void {
     session_destroy();
 }
 
+/** @return array<string,mixed>|null */
+function staff_account(string $email): ?array {
+    $st = db()->prepare("SELECT email, name, pass_hash, active FROM staff WHERE email = ?");
+    $st->execute([$email]);
+    $row = $st->fetch();
+    return $row ?: null;
+}
+
+function staff_verify_password(string $email, string $password): bool {
+    $row = staff_account($email);
+    return $row !== null && password_verify($password, (string)$row['pass_hash']);
+}
+
+function staff_display_name(?array $row, string $email): string {
+    $name = trim((string)($row['name'] ?? ''));
+    return $name !== '' ? $name : $email;
+}
+
 function csrf_token(): string {
     session_start_secure();
     return $_SESSION['csrf'] ??= bin2hex(random_bytes(16));

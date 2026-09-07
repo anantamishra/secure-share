@@ -1,0 +1,18 @@
+{
+    "name": "instawp/freescout-secure-handoff",
+    "description": "Mint InstaWP secure credential handoff links from FreeScout conversations",
+    "type": "freescout-module",
+    "license": "AGPL-3.0-or-later",
+    "autoload": {
+        "psr-4": {
+            "Modules\\SecureHandoff\\": ""
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Modules\\SecureHandoff\\Providers\\SecureHandoffServiceProvider"
+            ]
+        }
+    }
+}

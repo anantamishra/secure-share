@@ -1,0 +1,17 @@
+{
+    "name": "SecureHandoff",
+    "alias": "securehandoff",
+    "description": "Mint InstaWP secure credential handoff links from a FreeScout conversation. Credentials never enter the ticket.",
+    "keywords": ["credentials", "security", "handoff", "instawp"],
+    "version": "1.0.0",
+    "active": 1,
+    "order": 450,
+    "providers": [
+        "Modules\\SecureHandoff\\Providers\\SecureHandoffServiceProvider"
+    ],
+    "aliases": {},
+    "files": [
+        "start.php"
+    ],
+    "requires": []
+}

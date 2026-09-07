@@ -1,0 +1,45 @@
+.securehandoff-sidebar .form-group {
+    margin-bottom: 8px;
+}
+
+.securehandoff-sidebar label {
+    font-weight: 600;
+    font-size: 12px;
+}
+
+.securehandoff-request {
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    padding: 8px;
+    margin-bottom: 8px;
+    background: #fafafa;
+}
+
+.securehandoff-request-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+
+.securehandoff-need {
+    font-size: 12px;
+}
+
+.securehandoff-url-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+    align-items: center;
+}
+
+.securehandoff-url-row .securehandoff-url {
+    flex: 1 1 120px;
+    min-width: 0;
+}
+
+#securehandoff-form-msg,
+#securehandoff-test-result {
+    margin-top: 8px;
+}

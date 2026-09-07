@@ -1,8 +1,36 @@
-# Never commit runtime state or config — APP_KEY and the credential store live
-# outside the checkout on purpose (see README).
+# Runtime config and secrets — APP_KEY / DATA_DIR live outside the checkout
+# (see README). Never commit these.
+.env
+.env.*
+!.env.example
+handoff.env
+*.env
+!*.env.example
+
+# Credential store and local data dirs
+data/
+**/sessions/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
-handoff.env
-.env
-data/
+*.sqlite-journal
+
+# Logs and temp output (e2e / php -S / local sweeps)
+*.log
+*.tmp
+tmp/
+/tmp/
+
+# PHP / Composer (if added later)
+vendor/
+.phpunit.result.cache
+.php-cs-fixer.cache
+.phpstan.cache
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

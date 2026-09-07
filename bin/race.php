@@ -36,7 +36,7 @@ while ($running && $status === CURLM_OK);
 $hits = 0;
 foreach ($handles as $ch) {
     if (str_contains((string)curl_multi_getcontent($ch), $needle)) $hits++;
-    curl_multi_remove_handle($mh, $ch); curl_close($ch);
+    curl_multi_remove_handle($mh, $ch);
 }
 curl_multi_close($mh);
 echo $hits, "\n";

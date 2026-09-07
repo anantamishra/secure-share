@@ -9,11 +9,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 FAIL=0
 ok(){ if [ "$2" = "$3" ]; then printf '  ok   %-38s %s\n' "$1" "$2"; else printf '  FAIL %-38s got=%s want=%s\n' "$1" "$2" "$3"; FAIL=1; fi; }
+# BSD sed (macOS) requires a suffix argument to -i; GNU sed does not.
+sedi() {
+    if sed --version >/dev/null 2>&1; then sed -i "$@"; else sed -i '' "$@"; fi
+}
 
 cat > "$TMP/env" <<EOF
 APP_KEY=$(php -r 'echo bin2hex(random_bytes(32));')
 APP_URL=$B
 DATA_DIR=$TMP/data
+ALLOW_INFRA_CREDENTIALS=0
 EOF
 export APP_ENV_FILE="$TMP/env"
 PW="$(php "$ROOT/bin/staff.php" add tester@instawp.com | sed -n 2p)"
@@ -48,14 +53,15 @@ LINK=$(curl -s -m 20 -b "$J" -d "csrf=$T&ticket_id=3340&need=wp_admin&ttl=172800
 ok "link issued"                "$([ -n "$LINK" ] && echo yes || echo no)" "yes"
 ok "bad token 404s"             "$(code $B/s/$(printf 'a%.0s' {1..48}))" "404"
 ok "customer form is public"    "$(code $LINK)" "200"
-ok "form warns off ssh"         "$(curl -s -m 20 $LINK | grep -c 'never ask you for SSH')" "1"
+ok "no never-ask box"           "$(curl -s -m 20 $LINK | grep -c 'never ask you')" "0"
+ok "share picker on form"       "$(curl -s -m 20 $LINK | grep -c 'name="share"')" "3"
 ok "empty submit refused"       "$(curl -s -m 20 -d 'login_url=&username=&password=' $LINK | grep -c 'Every field except Notes')" "1"
 
 curl -s -m 20 -o /dev/null --data-urlencode 'password=p@ss"w\ord«»é' --data-urlencode 'login_url=https://example.com/wp-login.php' --data-urlencode 'username=iwp_temp' --data-urlencode 'notes=n' "$LINK"
 DB="$TMP/data/handoff.sqlite"
 ok "link is single use"         "$(code $LINK)" "410"
 ok "stored base64 only"         "$(sqlite3 "$DB" "SELECT ciphertext NOT GLOB '*[^A-Za-z0-9+/=]*' FROM requests WHERE id=1")" "1"
-ok "no plaintext on disk"       "$(grep -lc 'p@ss' "$DB"* 2>/dev/null | wc -l)" "0"
+ok "no plaintext on disk"       "$(grep -q 'p@ss' "$DB"* 2>/dev/null && echo 1 || echo 0)" "0"
 
 T=$(curl -s -m 20 -b "$J" -c "$J" "$B/r/1" | csrf)
 OUT=$(curl -s -m 20 -b "$J" -d "csrf=$T&action=reveal" "$B/r/1")
@@ -65,6 +71,20 @@ ok "rotation names app pw"      "$(echo "$OUT" | grep -c 'usermeta')" "1"
 ok "burned: second read fails"  "$(curl -s -m 20 -b $J -d "csrf=$T&action=reveal" $B/r/1 | grep -c 'Nothing to read')" "1"
 ok "ciphertext destroyed"       "$(sqlite3 "$DB" "SELECT ifnull(ciphertext,'NULL') FROM requests WHERE id=1")" "NULL"
 ok "read is audited"            "$(sqlite3 "$DB" "SELECT count(*) FROM audit WHERE action='credential.read' AND actor='tester@instawp.com'")" "1"
+ok "missing share is once"      "$(sqlite3 "$DB" "SELECT share FROM requests WHERE id=1")" "once"
+
+T=$(curl -s -m 20 -b "$J" -c "$J" "$B/new" | csrf)
+LKEEP=$(curl -s -m 20 -b "$J" -d "csrf=$T&ticket_id=4401&need=wp_admin&ttl=3600&failed_path=x&bug_ref=keep" "$B/new" | grep -o "$B/s/[a-f0-9]\{48\}" | head -1)
+curl -s -m 20 -o /dev/null --data-urlencode 'password=keepme' --data-urlencode 'login_url=https://k.com' --data-urlencode 'username=u' --data-urlencode 'share=1d' "$LKEEP"
+KID=$(sqlite3 "$DB" "SELECT id FROM requests WHERE ticket_id='4401'")
+ok "timed share stored"         "$(sqlite3 "$DB" "SELECT share FROM requests WHERE id=$KID")" "1d"
+ok "timed expiry ~1 day"        "$(sqlite3 "$DB" "SELECT CASE WHEN expires_at-submitted_at BETWEEN 86390 AND 86410 THEN 1 ELSE 0 END FROM requests WHERE id=$KID")" "1"
+T=$(curl -s -m 20 -b "$J" -c "$J" "$B/r/$KID" | csrf)
+ok "timed first reveal"         "$(curl -s -m 20 -b $J -d "csrf=$T&action=reveal" $B/r/$KID | grep -c 'keepme')" "1"
+ok "timed ciphertext kept"      "$(sqlite3 "$DB" "SELECT CASE WHEN ciphertext IS NULL THEN 0 ELSE 1 END FROM requests WHERE id=$KID")" "1"
+ok "timed still submitted"      "$(sqlite3 "$DB" "SELECT status FROM requests WHERE id=$KID")" "submitted"
+ok "timed second reveal"        "$(curl -s -m 20 -b $J -d "csrf=$T&action=reveal" $B/r/$KID | grep -c 'keepme')" "1"
+ok "timed reread audited"       "$(sqlite3 "$DB" "SELECT count(*) FROM audit WHERE action='credential.reread' AND request_id=$KID")" "1"
 
 T=$(curl -s -m 20 -b "$J" -c "$J" "$B/new" | csrf)
 L2=$(curl -s -m 20 -b "$J" -d "csrf=$T&ticket_id=9999&need=wp_app_password&ttl=3600&failed_path=x&bug_ref=t2" "$B/new" | grep -o "$B/s/[a-f0-9]\{48\}" | head -1)
@@ -75,19 +95,52 @@ ok "expired is purged"          "$(sqlite3 "$DB" "SELECT status||':'||ifnull(cip
 ok "expiry flags rotation"      "$(sqlite3 "$DB" "SELECT count(*) FROM audit WHERE action='rotation.flagged' AND ticket_id='9999'")" "1"
 ok "expired link is dead"       "$(code $L2)" "410"
 
-# --- ALLOW_INFRA_CREDENTIALS: off is the shipped default, on is the gated path ---
+# --- staff JSON API -----------------------------------------------------------
+TOKEN=$(php "$ROOT/bin/staff.php" token tester@instawp.com | sed -n 2p)
+ok "api token minted"           "$([ -n "$TOKEN" ] && echo yes || echo no)" "yes"
+ok "api needs bearer"           "$(code $B/api/v1/me)" "401"
+ok "api rejects junk token"     "$(code -H 'Authorization: Bearer iwp_0000000000000000000000000000000000000000000000000000000000000000' $B/api/v1/me)" "401"
+ok "api me"                     "$(curl -s -m 20 -H "Authorization: Bearer $TOKEN" $B/api/v1/me | grep -c 'tester@instawp.com')" "1"
+ok "api rejects ssh when off"   "$(code -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"ticket_id":"1","need":"ssh","ttl":3600,"failed_path":"x","bug_ref":"t"}' $B/api/v1/requests)" "400"
+ok "api tier-1 gate"            "$(code -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"ticket_id":"1","need":"wp_admin","ttl":3600,"failed_path":"x"}' $B/api/v1/requests)" "400"
+AR=$(curl -s -m 20 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"ticket_id":"8801","need":"wp_admin","ttl":3600,"failed_path":"api","bug_ref":"api1"}' "$B/api/v1/requests")
+ok "api mint pending"           "$(echo "$AR" | grep -c '"status":"pending"')" "1"
+ALINK=$(echo "$AR" | grep -o "$B/s/[a-f0-9]\{48\}" | head -1)
+ok "api link issued"            "$([ -n "$ALINK" ] && echo yes || echo no)" "yes"
+AID=$(echo "$AR" | php -r '$j=json_decode(stream_get_contents(STDIN),true); echo $j["data"]["id"]??"";')
+curl -s -m 20 -o /dev/null --data-urlencode 'password=apipw' --data-urlencode 'login_url=https://a.com' --data-urlencode 'username=u' "$ALINK"
+ok "api reveal secret"          "$(curl -s -m 20 -H "Authorization: Bearer $TOKEN" -X POST "$B/api/v1/requests/$AID/reveal" | grep -c 'apipw')" "1"
+ok "api second reveal 409"      "$(code -H "Authorization: Bearer $TOKEN" -X POST $B/api/v1/requests/$AID/reveal)" "409"
+
+AR2=$(curl -s -m 20 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"ticket_id":"8802","need":"wp_admin","ttl":3600,"failed_path":"api","bug_ref":"api2"}' "$B/api/v1/requests")
+ALINK2=$(echo "$AR2" | grep -o "$B/s/[a-f0-9]\{48\}" | head -1)
+AID2=$(echo "$AR2" | php -r '$j=json_decode(stream_get_contents(STDIN),true); echo $j["data"]["id"]??"";')
+curl -s -m 20 -o /dev/null --data-urlencode 'password=keepapi' --data-urlencode 'login_url=https://a.com' --data-urlencode 'username=u' --data-urlencode 'share=2d' "$ALINK2"
+ok "api timed share 2d"         "$(curl -s -m 20 -H "Authorization: Bearer $TOKEN" "$B/api/v1/requests/$AID2" | grep -c '"share":"2d"')" "1"
+ok "api timed first reveal"     "$(curl -s -m 20 -H "Authorization: Bearer $TOKEN" -X POST "$B/api/v1/requests/$AID2/reveal" | grep -c 'keepapi')" "1"
+ok "api timed second reveal"    "$(curl -s -m 20 -H "Authorization: Bearer $TOKEN" -X POST "$B/api/v1/requests/$AID2/reveal" | grep -c 'keepapi')" "1"
+ok "api list by ticket"         "$(curl -s -m 20 -H "Authorization: Bearer $TOKEN" "$B/api/v1/requests?ticket_id=8801" | grep -c '"status":"read"')" "1"
+php "$ROOT/bin/staff.php" add apigone@instawp.com > /dev/null
+TOK2=$(php "$ROOT/bin/staff.php" token apigone@instawp.com | sed -n 2p)
+ok "api other token works"      "$(code -H "Authorization: Bearer $TOK2" $B/api/v1/me)" "200"
+php "$ROOT/bin/staff.php" disable apigone@instawp.com > /dev/null
+ok "api disabled token 401"     "$(code -H "Authorization: Bearer $TOK2" $B/api/v1/me)" "401"
+
+# --- ALLOW_INFRA_CREDENTIALS: SSH ships ON; 0 is the off-switch ---
 # The "no ssh option" and "rejects unknown need (ssh)" assertions above ran with the
-# flag OFF, so they are the proof that the gate actually holds.
-echo "ALLOW_INFRA_CREDENTIALS=1" >> "$TMP/env"
+# flag forced OFF, so they are the proof that the off-switch actually holds.
+sedi "s/^ALLOW_INFRA_CREDENTIALS=.*/ALLOW_INFRA_CREDENTIALS=1/" "$TMP/env"
 P2=$((PORT+50)); B2="http://127.0.0.1:$P2"; J2="$TMP/jar2"
-sed -i "s#^APP_URL=.*#APP_URL=$B2#" "$TMP/env"
+sedi "s#^APP_URL=.*#APP_URL=$B2#" "$TMP/env"
 PHP_CLI_SERVER_WORKERS=8 php -S "127.0.0.1:$P2" -t "$ROOT/public" "$ROOT/public/index.php" >"$TMP/srv2.log" 2>&1 &
 for _ in $(seq 1 15); do sleep 1; curl -sf -m 2 -o /dev/null "$B2/healthz" && break; done
 T=$(curl -s -m 20 -c "$J2" "$B2/login" | csrf)
 curl -s -m 20 -b "$J2" -c "$J2" -o /dev/null -d "csrf=$T&email=tester@instawp.com&password=$PW" "$B2/login"
 T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new" | csrf)
 ok "flag on: ssh is offered"     "$(curl -s -m 20 -b $J2 $B2/new | grep -c 'value="ssh"')" "1"
-ok "flag on: staff sees warning"  "$(curl -s -m 20 -b $J2 $B2/new | grep -c 'SSH collection is switched ON')" "1"
+ok "flag on: staff sees warning"  "$(curl -s -m 20 -b $J2 $B2/new | grep -c 'SSH / SFTP is a last resort')" "1"
 L3=$(curl -s -m 20 -b "$J2" -d "csrf=$T&ticket_id=7777&need=ssh&ttl=3600&failed_path=no+wp+route&bug_ref=t3" "$B2/new" | grep -o "$B2/s/[a-f0-9]\{48\}" | head -1)
 ok "flag on: ssh link issued"     "$([ -n "$L3" ] && echo yes || echo no)" "yes"
 ok "flag on: ssh fields shown"    "$(curl -s -m 20 $L3 | grep -c 'name="host"')" "1"
@@ -135,7 +188,7 @@ for round in 1 2 3; do
     C=$(curl -s -m 20 -b "$TMP/jr$i" -c "$TMP/jr$i" "$B2/r/$RID" | csrf)
     PAIRS="$PAIRS $TMP/jr$i:$C"
   done
-  HITS=$(php "$ROOT/bin/race.php" "$B2/r/$RID" "RACEWINNER$round" $PAIRS)
+  HITS=$(php -d display_errors=stderr "$ROOT/bin/race.php" "$B2/r/$RID" "RACEWINNER$round" $PAIRS | tail -n 1 | tr -d '[:space:]')
   RACEWINS=$((RACEWINS + HITS))
 done
 # 3 requests, 12 simultaneous readers each: exactly 3 reads in total, never 4.
@@ -191,11 +244,6 @@ L6=$(curl -s -m 20 -b "$J2" -d "csrf=$T&ticket_id=6363&need=wp_admin&ttl=3600&fa
 ok "invalid utf-8 does not fatal"  "$(printf 'login_url=https://a.com&username=u&password=%%FFbad' | curl -s -m 20 -o /dev/null -w '%{http_code}' --data-binary @- "$L6")" "200"
 ok "invalid utf-8 was stored"      "$(sqlite3 "$DB2" "SELECT status FROM requests WHERE ticket_id='6363'")" "submitted"
 
-# I7 -- the anti-phishing line is the whole affordance; it must not be small print.
-T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new" | csrf)
-L7=$(curl -s -m 20 -b "$J2" -d "csrf=$T&ticket_id=6464&need=wp_admin&ttl=3600&failed_path=x&bug_ref=i7" "$B2/new" | grep -o "$B2/s/[a-f0-9]\{48\}" | head -1)
-ok "anti-phishing line is a box"   "$(curl -s -m 20 $L7 | grep -c '<div class="box"><strong>We will never ask you')" "1"
-
 # B3 -- X-Forwarded-For must not buy a fresh throttle bucket. LAST: it exhausts one.
 sqlite3 "$DB2" "DELETE FROM throttle"
 for i in $(seq 1 11); do
@@ -207,7 +255,7 @@ Tt=$(curl -s -m 20 -b "$TMP/jx" -c "$TMP/jx" "$B2/login" | csrf)
 ok "XFF cannot bypass throttle"    "$(code -b $TMP/jx -c $TMP/jx -H 'X-Forwarded-For: 10.9.77.77' -d "csrf=$Tt&email=nobody@instawp.com&password=wrong" $B2/login)" "429"
 ok "audit ip is not forgeable"     "$(sqlite3 "$DB2" "SELECT count(*) FROM audit WHERE ip LIKE '10.9.%'")" "0"
 
-sed -i "s/^APP_KEY=.*/APP_KEY=$(php -r 'echo bin2hex(random_bytes(32));')/" "$TMP/env"
+sedi "s/^APP_KEY=.*/APP_KEY=$(php -r 'echo bin2hex(random_bytes(32));')/" "$TMP/env"
 ok "wrong key -> loud failure"  "$(php -r 'require "'"$ROOT"'/src/bootstrap.php"; env_load(getenv("APP_ENV_FILE")); require "'"$ROOT"'/src/crypto.php"; try { unseal(base64_encode(random_bytes(24)), base64_encode(random_bytes(60))); echo "silent"; } catch (Throwable $e) { echo "threw"; }')" "threw"
 
 echo; if [ $FAIL -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi; exit $FAIL

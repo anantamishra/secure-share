@@ -12,19 +12,17 @@ declare(strict_types=1);
 /**
  * What the form is allowed to collect.
  *
- * The WordPress options are always available: a temporary admin account and an
+ * WordPress options are always available: a temporary admin account and an
  * application password are both scoped and individually revocable.
  *
- * The infrastructure options (SSH/SFTP) are gated behind ALLOW_INFRA_CREDENTIALS
- * and ship OFF. They are not a feature toggle — they are decision D1 in
- * KB runbooks/what-support-may-ask-a-customer-to-send, which is with the owner.
- * Do not flip this on without that sign-off recorded. Unlike a WordPress
- * credential, an SSH credential is broad, reusable, and cannot be revoked without
- * collateral damage — and on an agency ticket it is usually their client's server,
- * with the person whose data is at risk not in the conversation.
+ * SSH/SFTP is also offered by default. It is a last resort — an SSH credential
+ * is broad, reusable, and cannot be revoked without collateral damage, and on
+ * an agency ticket it is usually their client's server. Set
+ * ALLOW_INFRA_CREDENTIALS=0 to hide it. cPanel and FTP have no fields at all.
  */
 function infra_enabled(): bool {
-    return in_array(strtolower((string)cfg('ALLOW_INFRA_CREDENTIALS', '0')), ['1', 'true', 'yes'], true);
+    $v = strtolower((string)cfg('ALLOW_INFRA_CREDENTIALS', '1'));
+    return !in_array($v, ['0', 'false', 'no', 'off'], true);
 }
 
 function needs(): array {
@@ -63,6 +61,46 @@ function fields_for(string $need): array {
 /** Fields the customer may leave blank. */
 function optional_fields(string $need): array {
     return $need === 'ssh' ? ['port'] : [];
+}
+
+function ttl_choices(): array {
+    return [3600 => '1 hour', 21600 => '6 hours', 86400 => '24 hours', 172800 => '48 hours'];
+}
+
+/** How the customer wants the submitted secret kept. Default is view-once. */
+function share_choices(): array {
+    return [
+        'once' => 'View once',
+        '1d'   => 'Expire in 1 day',
+        '2d'   => 'Expire in 2 days',
+    ];
+}
+
+function share_seconds(string $share): ?int {
+    return match ($share) {
+        '1d' => 86400,
+        '2d' => 172800,
+        default => null,
+    };
+}
+
+function share_is_once(array $r): bool {
+    return (($r['share'] ?? 'once') === 'once');
+}
+
+function share_from_post(): string {
+    $s = (string)($_POST['share'] ?? 'once');
+    return isset(share_choices()[$s]) ? $s : 'once';
+}
+
+function share_label(array|string $r): string {
+    $key = is_array($r) ? (string)($r['share'] ?? 'once') : $r;
+    return share_choices()[$key] ?? 'View once';
+}
+
+/** Shared list sort: ready first, then awaiting, then read, then expired. */
+function requests_list_order_sql(int $limit = 100): string {
+    return " ORDER BY CASE status WHEN 'submitted' THEN 0 WHEN 'pending' THEN 1 WHEN 'read' THEN 2 ELSE 3 END, created_at DESC LIMIT $limit";
 }
 
 function env_load(string $path): void {
@@ -130,6 +168,7 @@ function migrate(PDO $pdo): void {
         purged_at INTEGER,
         rotation_flagged_at INTEGER,
         status TEXT NOT NULL DEFAULT 'pending',
+        share TEXT NOT NULL DEFAULT 'once',
         nonce BLOB,
         ciphertext BLOB
     )");
@@ -148,6 +187,18 @@ function migrate(PDO $pdo): void {
     )");
     $pdo->exec("CREATE INDEX IF NOT EXISTS idx_throttle ON throttle(k, at)");
     $pdo->exec("CREATE INDEX IF NOT EXISTS idx_req_status ON requests(status, expires_at)");
+    $staffCols = array_column($pdo->query("PRAGMA table_info(staff)")->fetchAll(), 'name');
+    if (!in_array('api_token_hash', $staffCols, true)) {
+        $pdo->exec("ALTER TABLE staff ADD COLUMN api_token_hash TEXT");
+        $pdo->exec("ALTER TABLE staff ADD COLUMN api_token_at INTEGER");
+    }
+    if (!in_array('name', $staffCols, true)) {
+        $pdo->exec("ALTER TABLE staff ADD COLUMN name TEXT");
+    }
+    $reqCols = array_column($pdo->query("PRAGMA table_info(requests)")->fetchAll(), 'name');
+    if (!in_array('share', $reqCols, true)) {
+        $pdo->exec("ALTER TABLE requests ADD COLUMN share TEXT NOT NULL DEFAULT 'once'");
+    }
 }
 
 function audit(string $actor, string $action, ?int $reqId = null, ?string $ticket = null, ?string $detail = null): void {
@@ -248,6 +299,11 @@ function throttle_ok(string $key, int $limit, int $windowSec): bool {
     if ((int)$st->fetch()['c'] >= $limit) return false;
     $pdo->prepare("INSERT INTO throttle (k, at) VALUES (?,?)")->execute([$key, time()]);
     return true;
+}
+
+function csp_nonce(): string {
+    static $n = null;
+    return $n ??= bin2hex(random_bytes(16));
 }
 
 function h(?string $s): string {

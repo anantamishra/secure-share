@@ -8,14 +8,24 @@ require __DIR__ . '/../src/auth.php';
 require __DIR__ . '/../src/views.php';
 require __DIR__ . '/../src/freescout.php';
 require __DIR__ . '/../src/rotation.php';
+require __DIR__ . '/../src/requests.php';
+require __DIR__ . '/../src/api.php';
 
 // Without this an uncaught throwable renders a blank page (or, if the pod ever has
 // zend.exception_ignore_args=Off, a stack trace whose frames include the plaintext
 // credential and the master key). Neither is acceptable on this app.
 set_exception_handler(function (Throwable $e): void {
-    if (!headers_sent()) { http_response_code(500); header('Content-Type: text/plain'); }
+    $api = str_starts_with(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/', '/api/');
+    if (!headers_sent()) {
+        http_response_code(500);
+        header('Content-Type: ' . ($api ? 'application/json; charset=utf-8' : 'text/plain'));
+    }
     try { audit('system', 'unhandled.exception', null, null, get_class($e) . ': ' . $e->getMessage()); }
     catch (Throwable $ignored) { /* the DB is the thing that failed; do not mask it */ }
+    if ($api) {
+        echo json_encode(['ok' => false, 'error' => ['code' => 'internal', 'message' => 'Something went wrong and has been logged.']]);
+        return;
+    }
     echo "Something went wrong and has been logged.\n"
        . "If you were opening a credential, check the request page before asking the customer again:\n"
        . "it may already have been marked read.\n";
@@ -23,29 +33,15 @@ set_exception_handler(function (Throwable $e): void {
 header('X-Frame-Options: DENY');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: no-referrer');
-header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'");
+header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-" . csp_nonce() . "'; form-action 'self'; frame-ancestors 'none'");
 
 $path   = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $base   = rtrim(cfg('APP_URL', 'https://' . ($_SERVER['HTTP_HOST'] ?? 'localhost')), '/');
 
-function ttl_choices(): array {
-    return [3600 => '1 hour', 21600 => '6 hours', 86400 => '24 hours', 172800 => '48 hours'];
-}
-
 /** Expire and purge anything past its deadline. Cheap, so run it on every request. */
 function sweep(): void {
-    $pdo = db();
-    $st  = $pdo->prepare("SELECT * FROM requests WHERE expires_at < ? AND status IN ('pending','submitted','read')");
-    $st->execute([time()]);
-    foreach ($st->fetchAll() as $r) {
-        $pdo->prepare("UPDATE requests SET status='expired', purged_at=?, nonce=NULL, ciphertext=NULL WHERE id=?")
-            ->execute([time(), $r['id']]);
-        audit('system', 'request.expired.purged', (int)$r['id'], $r['ticket_id']);
-        // flag_rotation() marks locally and defers its own FreeScout call, so this is
-        // safe to run inline even though the sweep fires on every request.
-        if ($r['submitted_at'] !== null) flag_rotation((int)$r['id']);
-    }
+    purge_expired('system');
 }
 
 if ($path === '/healthz') {
@@ -57,6 +53,10 @@ if ($path === '/healthz') {
 
 sweep();
 
+if (str_starts_with($path, '/api/')) {
+    api_dispatch($path, $method, $base);
+}
+
 // ---------------------------------------------------------------- customer side
 
 if (preg_match('#^/s/([a-f0-9]{48})$#', $path, $m)) {
@@ -66,7 +66,8 @@ if (preg_match('#^/s/([a-f0-9]{48})$#', $path, $m)) {
 
     $gone = fn(string $why) => print(layout('Link unavailable',
         '<div class="box danger"><strong>This link is no longer usable.</strong><p>' . h($why) . '</p></div>
-         <p class="mut">If you still need to send us access, reply on your support ticket and we will issue a new link.</p>'));
+         <p class="mut">If you still need to send us access, reply on your support ticket and we will issue a new link.</p>',
+        null, ['audience' => 'customer']));
 
     if (!$r)                        { http_response_code(404); $gone('The link is not valid.'); exit; }
     if ($r['status'] !== 'pending') { http_response_code(410); $gone('It has already been used.'); exit; }
@@ -87,6 +88,7 @@ if (preg_match('#^/s/([a-f0-9]{48})$#', $path, $m)) {
             $payload[$lbl] = $v;
         }
         $payload['Notes'] = trim((string)($_POST['notes'] ?? ''));
+        $share = share_from_post();
 
         if ($missing) {
             $err = '<div class="box danger">Every field except Notes' . ($optional ? ' and Port' : '') . ' is required.</div>';
@@ -97,56 +99,52 @@ if (preg_match('#^/s/([a-f0-9]{48})$#', $path, $m)) {
             // failure. Substituting keeps the field readable rather than dropping it.
             $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
             [$nonce, $ct] = seal((string)$json);
+            $secs    = share_seconds($share);
+            $keepExp = $secs === null ? (int)$r['expires_at'] : time() + $secs;
             // Guarded on status: a submit racing the expiry sweep would otherwise write
             // ciphertext back onto a row that had just been purged, and a double-submit
             // would overwrite the first payload.
-            $upd = db()->prepare("UPDATE requests SET status='submitted', submitted_at=?, nonce=?, ciphertext=?, site_url=? WHERE id=? AND status='pending'");
-            $upd->execute([time(), $nonce, $ct, $payload[$fields[array_key_first($fields)]], $r['id']]);
+            $upd = db()->prepare("UPDATE requests SET status='submitted', submitted_at=?, nonce=?, ciphertext=?, site_url=?, share=?, expires_at=? WHERE id=? AND status='pending'");
+            $upd->execute([time(), $nonce, $ct, $payload[$fields[array_key_first($fields)]], $share, $keepExp, $r['id']]);
             if ($upd->rowCount() !== 1) {
                 http_response_code(410); $gone('It has already been used.'); exit;
             }
-            audit('customer', 'credential.submitted', (int)$r['id'], $r['ticket_id']);
+            audit('customer', 'credential.submitted', (int)$r['id'], $r['ticket_id'], "share=$share");
+            $until = gmdate('Y-m-d H:i', $keepExp);
+            $noteKeep = $share === 'once'
+                ? "They are readable ONCE, then destroyed. Expires $until UTC."
+                : "The customer asked us to keep them until $until UTC. They can be opened again until then.";
+            $thanks = $share === 'once'
+                ? 'Your details are encrypted and can be opened once by the engineer working your ticket, then destroyed automatically.'
+                : 'Your details are encrypted and will be available to the engineer until ' . local_time($keepExp) . ', then destroyed automatically.';
             defer(fn() => freescout_note($r['ticket_id'],
                 "Automated note — secure credential handoff.\n\n" .
                 "The customer has submitted credentials through the secure form.\n" .
                 "Read them at: {$GLOBALS['base']}/r/{$r['id']}\n\n" .
-                "They are readable ONCE, then destroyed. Expires " . gmdate('Y-m-d H:i', (int)$r['expires_at']) . " UTC."));
+                $noteKeep));
             echo layout('Received',
-                '<div class="box"><strong>Thank you — received.</strong>
-                 <p>Your details are encrypted and can be opened once by the engineer working your ticket, then destroyed automatically.</p></div>
-                 <p class="mut">You can close this page. Once we are finished we will ask you to change the password and remove the access you created.</p>');
+                '<div class="box ok"><strong>Thank you — received.</strong>
+                 <p>' . $thanks . '</p></div>
+                 <p class="mut">You can close this page. Once we are finished we will ask you to change the password and remove the access you created.</p>',
+                null, ['audience' => 'customer']);
             exit;
         }
     }
 
     $intro = match ($r['need']) {
-        'wp_admin' => '<p>Please create a <strong>temporary WordPress administrator account</strong> for us and
-            enter its details below — rather than sending your own login. You can delete it as soon as we are done.</p>',
-        'wp_app_password' => '<p>Please enter a <strong>WordPress application password</strong> created for us
-            (Users &rarr; Profile &rarr; Application Passwords). It can be revoked on its own, without changing
-            your password.</p>',
-        'ssh' => '<p>Please enter <strong>SSH/SFTP details</strong> for the server. Where your host allows it,
-            create a separate account for us rather than sharing your own, and remove it when we are finished.</p>',
+        'wp_admin' => '<p class="lede">Create a temporary WordPress administrator account and enter it below.</p>',
+        'wp_app_password' => '<p class="lede">Enter a WordPress application password created for us (Users &rarr; Profile).</p>',
+        'ssh' => '<p class="lede">Enter SSH/SFTP details for a separate account if your host allows one.</p>',
         default => '',
     };
 
     // An SSH credential cannot be narrowed or revoked the way a WordPress one can,
     // so the customer is told plainly what to do afterwards, on the form itself.
-    // The closing line doubles as an anti-phishing signal, so it must stay true:
-    // it may only name what this instance genuinely never asks for.
-    $extra = match (true) {
-        $r['need'] === 'ssh' => '<div class="box danger"><strong>Please change this password once we are done.</strong>
+    $extra = $r['need'] === 'ssh'
+        ? '<div class="box danger"><strong>Please change this password once we are done.</strong>
             Server credentials usually unlock more than one site, so treat anything you send here as disclosed.
-            We will remind you on the ticket as well.</div>',
-        // Given its own box rather than muted small print: this single line is the whole
-        // anti-phishing affordance, and it was previously the least prominent text on the
-        // page. Wording is unchanged and still flag-aware -- it may only name what this
-        // instance genuinely never asks for.
-        infra_enabled() => '<div class="box"><strong>We will never ask you for cPanel or FTP credentials.</strong>
-            If anyone claiming to be from InstaWP asks for those, please tell us.</div>',
-        default => '<div class="box"><strong>We will never ask you for SSH, cPanel or FTP credentials.</strong>
-            If anyone claiming to be from InstaWP asks for those, please tell us.</div>',
-    };
+            We will remind you on the ticket as well.</div>'
+        : '';
 
     $inputs = '';
     $optional = optional_fields($r['need']);
@@ -155,24 +153,48 @@ if (preg_match('#^/s/([a-f0-9]{48})$#', $path, $m)) {
         $req  = in_array($k, $optional, true) ? '' : ' required';
         $ph   = $k === 'login_url' ? ' placeholder="https://example.com/wp-login.php"'
               : ($k === 'port' ? ' placeholder="22"' : '');
-        $inputs .= '<label>' . h($lbl) . ($req ? '' : ' (optional)') . '</label>'
-                .  '<input name="' . h($k) . '" type="' . $type . '" autocomplete="off"' . $ph . $req . '>';
+        $auto = $k === 'password' ? 'new-password' : 'off';
+        $id   = 'f-' . $k;
+        $keep = $k === 'password' ? '' : ' value="' . posted_value($k) . '"';
+        if ($k === 'password' && $r['need'] === 'ssh') {
+            $inputs .= '<div class="field"><label for="' . $id . '">' . h($lbl) . '</label>'
+                    . '<textarea id="' . $id . '" name="' . h($k) . '" rows="6" autocomplete="off" spellcheck="false" autocapitalize="off" required></textarea>'
+                    . '<p class="hint">Paste a password or a private key. Prefer a separate account created for this ticket.</p></div>';
+            continue;
+        }
+        $inputs .= '<div class="field"><label for="' . $id . '">' . h($lbl) . ($req ? '' : ' (optional)') . '</label>'
+                . '<input id="' . $id . '" name="' . h($k) . '" type="' . $type . '" autocomplete="' . $auto . '" spellcheck="false" autocapitalize="off"' . $ph . $keep . $req . '></div>';
+    }
+
+    $sharePicked = share_from_post();
+    $shareRadios = '';
+    foreach (share_choices() as $val => $lbl) {
+        $chk = $sharePicked === $val ? ' checked' : '';
+        $shareRadios .= '<label><input type="radio" name="share" value="' . h($val) . '" required' . $chk . '> '
+                      . h($lbl) . "</label>\n";
     }
 
     echo layout('Send credentials securely',
         ($err ?? '') . '
         <h2>Ticket #' . h($r['ticket_id']) . '</h2>
+        <p class="lede">This link is single-use. Details are encrypted. Choose below how long the engineer can keep them.</p>
         ' . $intro . '
-        <div class="box"><strong>Why this form.</strong> Anything typed into an email or a support ticket stays in
-        both mailboxes permanently. This link is single-use, the details are encrypted, and they are destroyed
-        automatically on ' . h(gmdate('j M Y H:i', (int)$r['expires_at'])) . ' UTC.</div>
-        <form method="post">
+        <p class="mut">This form expires ' . local_time((int)$r['expires_at']) . '</p>
+        ' . $extra . '
+        <form method="post" autocomplete="off" class="card">
           ' . $inputs . '
-          <label>Anything we should know (optional)</label>
-          <textarea name="notes" rows="3"></textarea>
-          <p style="margin-top:18px"><button>Send securely</button></p>
-        </form>
-        ' . $extra);
+          <div class="field">
+            <label for="f-notes">Notes (optional)</label>
+            <textarea id="f-notes" name="notes" rows="2">' . posted_value('notes') . '</textarea>
+          </div>
+          <fieldset class="share">
+            <legend>How long should we keep this?</legend>
+            ' . $shareRadios . '
+            <p class="hint">View once is destroyed when the engineer opens it. 1 day and 2 days can be opened again until they expire.</p>
+          </fieldset>
+          <p class="btn-row"><button class="btn-block" type="submit">Send securely</button></p>
+        </form>',
+        null, ['audience' => 'customer']);
     exit;
 }
 
@@ -197,12 +219,23 @@ if ($path === '/login') {
         $err = '<div class="box danger">Wrong email or password.</div>';
     }
     echo layout('Sign in', ($err ?? '') . '
-        <form method="post" style="max-width:360px">
-          <input type="hidden" name="csrf" value="' . h(csrf_token()) . '">
-          <label>Email</label><input name="email" type="email" required autofocus>
-          <label>Password</label><input name="password" type="password" required>
-          <p style="margin-top:18px"><button>Sign in</button></p>
-        </form>');
+        <div class="card">
+          <h2>Sign in</h2>
+          <p class="lede">Staff only. Customer links do not use this page.</p>
+          <form method="post">
+            <input type="hidden" name="csrf" value="' . h(csrf_token()) . '">
+            <div class="field">
+              <label for="email">Email</label>
+              <input id="email" name="email" type="email" required autofocus autocomplete="username" value="' . posted_value('email') . '">
+            </div>
+            <div class="field">
+              <label for="password">Password</label>
+              <input id="password" name="password" type="password" required autocomplete="current-password">
+            </div>
+            <p class="btn-row"><button class="btn-block" type="submit">Sign in</button></p>
+          </form>
+        </div>',
+        null, ['audience' => 'guest']);
     exit;
 }
 
@@ -216,17 +249,99 @@ if ($path === '/logout' && $method === 'POST') {
 $staff = require_staff();
 
 if ($path === '/') {
-    $rows = db()->query("SELECT * FROM requests ORDER BY created_at DESC LIMIT 100")->fetchAll();
-    $body = '<h2>Requests</h2><div class="scroll"><table><tr><th>Ticket</th><th>Needed</th><th>Status</th><th>Expires</th><th>Raised by</th><th></th></tr>';
-    foreach ($rows as $r) {
-        $pill = ['pending' => 'awaiting customer', 'submitted' => 'ready to read',
-                 'read' => 'read &amp; destroyed', 'expired' => 'expired &amp; purged'][$r['status']] ?? $r['status'];
-        $body .= '<tr><td>#' . h($r['ticket_id']) . '</td><td>' . h(needs()[$r['need']] ?? $r['need'])
-              . '</td><td><span class="pill">' . $pill . '</span></td><td>' . h(gmdate('j M H:i', (int)$r['expires_at']))
-              . '</td><td class="mut">' . h($r['requested_by']) . '</td><td><a href="/r/' . (int)$r['id'] . '">open</a></td></tr>';
+    if ($method === 'POST' && (isset($_POST['delete_one']) || isset($_POST['expire_one']))) {
+        csrf_check();
+        if (isset($_POST['delete_one'])) {
+            delete_request((int)$_POST['delete_one'], $staff);
+        } else {
+            expire_request((int)$_POST['expire_one'], $staff);
+        }
+        $back = (string)($_POST['status'] ?? 'all');
+        if ($back !== 'all' && !isset(['pending' => 1, 'submitted' => 1, 'read' => 1, 'expired' => 1][$back])) {
+            $back = 'all';
+        }
+        redirect('/?status=' . $back);
     }
-    if (!$rows) $body .= '<tr><td colspan="6" class="mut">Nothing yet. <a href="/new">Raise a request</a>.</td></tr>';
-    echo layout('Requests', $body . '</table></div>', $staff);
+
+    $allowed = ['pending' => 'Awaiting', 'submitted' => 'Ready', 'read' => 'Read', 'expired' => 'Expired'];
+    $counts = ['pending' => 0, 'submitted' => 0, 'read' => 0, 'expired' => 0];
+    foreach (db()->query("SELECT status, COUNT(*) c FROM requests GROUP BY status")->fetchAll() as $c) {
+        $counts[$c['status']] = (int)$c['c'];
+    }
+    $total = array_sum($counts);
+    $fallback = $counts['read'] > 0 ? 'read' : '';
+    if (!isset($_GET['status'])) {
+        $statusFilter = $fallback;
+    } else {
+        $raw = (string)$_GET['status'];
+        $statusFilter = $raw === 'all' ? '' : (isset($allowed[$raw]) ? $raw : $fallback);
+    }
+
+    $sql = "SELECT * FROM requests";
+    $params = [];
+    if (isset($allowed[$statusFilter])) {
+        $sql .= " WHERE status = ?";
+        $params[] = $statusFilter;
+    }
+    $sql .= requests_list_order_sql();
+    $st = db()->prepare($sql);
+    $st->execute($params);
+    $rows = $st->fetchAll();
+
+    $ready = $counts['submitted'];
+    $banner = $ready > 0 && $statusFilter === ''
+        ? '<div class="box warn"><strong>' . $ready . ' request' . ($ready === 1 ? '' : 's') . ' ready to read.</strong> Open ' . ($ready === 1 ? 'it' : 'one') . ' only when you are ready to use the credential — reading destroys the stored copy.</div>'
+        : '';
+
+    $filters = '<div class="filters" role="navigation" aria-label="Filter by status">';
+    $allOn = $statusFilter === '' ? ' class="on"' : '';
+    $filters .= '<a href="/?status=all"' . $allOn . '>All (' . $total . ')</a>';
+    foreach ($allowed as $k => $label) {
+        $on = $statusFilter === $k ? ' class="on"' : '';
+        $filters .= '<a href="/?status=' . $k . '"' . $on . '>' . $label . ' (' . $counts[$k] . ')</a>';
+    }
+    $filters .= '</div>';
+
+    $statusQs = $statusFilter === '' ? 'all' : $statusFilter;
+    $body = '<div class="pagehead"><h2>Requests</h2><a class="btn" href="/new">New request</a></div>'
+          . $banner . $filters;
+    if (!$rows) {
+        $body .= '<div class="box"><div class="empty"><strong>Nothing yet.</strong>'
+              . ($statusFilter !== ''
+                  ? '<p>No requests in this status.</p>'
+                  : '<p>Raise a request to mint a single-use customer link.</p><p><a class="btn" href="/new">New request</a></p>')
+              . '</div></div>';
+    } else {
+        $body .= '<form method="post" data-confirm>'
+              . '<input type="hidden" name="csrf" value="' . h(csrf_token()) . '">'
+              . '<input type="hidden" name="status" value="' . h($statusQs) . '">'
+              . '<div class="scroll"><table><thead><tr>'
+              . '<th scope="col">Ticket</th><th scope="col">Needed</th><th scope="col">Status</th>'
+              . '<th scope="col">Expires</th><th scope="col">Raised by</th>'
+              . '<th scope="col">Actions</th>'
+              . '</tr></thead><tbody>';
+        foreach ($rows as $r) {
+            $id = (int)$r['id'];
+            $rowCls = $r['status'] === 'submitted' ? ' class="row-ready"' : '';
+            $needFull = needs()[$r['need']] ?? $r['need'];
+            $expireBtn = $r['status'] !== 'expired'
+                ? '<button class="ico-btn expire" type="submit" name="expire_one" value="' . $id . '" data-kind="expire" aria-label="Expire">'
+                  . icon_expire_svg() . '<span class="ico-name">Expire</span></button>'
+                : '<button class="ico-btn expire" type="button" disabled aria-label="Already expired">'
+                  . icon_expire_svg() . '<span class="ico-name">Already expired</span></button>';
+            $body .= '<tr' . $rowCls . '>'
+                  . '<td><a class="rowlink" href="/r/' . $id . '">#' . h($r['ticket_id']) . '</a></td>'
+                  . '<td class="need-short" title="' . h($needFull) . '">' . h(need_short((string)$r['need'])) . '</td>'
+                  . '<td>' . status_pill($r['status']) . '</td>'
+                  . '<td>' . local_time((int)$r['expires_at'], 'short') . '</td>'
+                  . '<td class="mut">' . h($r['requested_by']) . '</td>'
+                  . '<td class="row-act">' . $expireBtn
+                  . '<button class="ico-btn del" type="submit" name="delete_one" value="' . $id . '" aria-label="Delete">'
+                  . icon_delete_svg() . '<span class="ico-name">Delete</span></button></td></tr>';
+        }
+        $body .= '</tbody></table></div></form>';
+    }
+    echo layout('Requests', $body, $staff);
     exit;
 }
 
@@ -239,43 +354,58 @@ if ($path === '/new') {
         $bug    = trim((string)($_POST['bug_ref'] ?? ''));
         $ttl    = (int)($_POST['ttl'] ?? 172800);
 
-        if ($ticket === '' || !isset(needs()[$need]) || $failed === '' || $bug === '' || !isset(ttl_choices()[$ttl])) {
+        if (!request_fields_valid($ticket, $need, $failed, $bug, $ttl)) {
             $err = '<div class="box danger">Every field is required, including the two below the line.</div>';
         } else {
-            $token = new_token();
-            db()->prepare("INSERT INTO requests (token,ticket_id,need,failed_path,bug_ref,requested_by,created_at,expires_at)
-                           VALUES (?,?,?,?,?,?,?,?)")
-                ->execute([$token, $ticket, $need, $failed, $bug, $staff, time(), time() + $ttl]);
-            $id = (int)db()->lastInsertId();
-            audit($staff, 'request.created', $id, $ticket, "need=$need ttl={$ttl}s bug=$bug");
-            $link = $base . '/s/' . $token;
-            freescout_note($ticket,
-                "Automated note — secure credential handoff.\n\n" .
-                "$staff raised a credential request (" . needs()[$need] . ").\n" .
-                "Product path that failed: $failed\nBug reference: $bug\n\n" .
-                "Send the customer this single-use link:\n$link\n\nIt expires " . gmdate('Y-m-d H:i', time() + $ttl) . " UTC.");
+            $minted = mint_request($staff, $ticket, $need, $failed, $bug, $ttl, $base);
+            $link   = $minted['url'];
+            $ttlExp = $minted['expires_at'];
             echo layout('Link ready',
-                '<div class="box"><strong>Send this to the customer.</strong>
-                 <pre>' . h($link) . '</pre>
-                 <p class="mut">Single use, expires ' . h(gmdate('j M Y H:i', time() + $ttl)) . ' UTC. Paste the link into the ticket — never ask for the credential in the reply itself.</p></div>
-                 <p><a href="/">Back to requests</a></p>', $staff);
+                '<div class="box ok"><strong>Send this to the customer.</strong>
+                 <p class="hint" style="margin-bottom:10px">Copy the link and paste it into the ticket — never ask for the credential in the reply itself.</p>
+                 ' . copyable_link($link) . '
+                 <p class="mut" style="margin-top:12px">Single use, expires ' . local_time($ttlExp) . '.</p></div>
+                 <p class="btn-row"><a class="btn" href="/">Back to requests</a><a class="btn btn-ghost" href="/new">Raise another</a></p>', $staff);
             exit;
         }
     }
-    $opts = '';
-    foreach (needs() as $k => $v) $opts .= '<option value="' . h($k) . '">' . h($v) . '</option>';
+    $opts = '<optgroup label="WordPress">';
+    foreach (['wp_admin', 'wp_app_password'] as $k) {
+        if (!isset(needs()[$k])) continue;
+        $opts .= '<option value="' . h($k) . '"' . option_selected('need', $k) . '>' . h(needs()[$k]) . '</option>';
+    }
+    $opts .= '</optgroup>';
+    if (isset(needs()['ssh'])) {
+        $opts .= '<optgroup label="Server"><option value="ssh"' . option_selected('need', 'ssh') . '>'
+              . h(needs()['ssh']) . '</option></optgroup>';
+    }
     $ttls = '';
-    foreach (ttl_choices() as $k => $v) $ttls .= '<option value="' . $k . '"' . ($k === 172800 ? ' selected' : '') . '>' . h($v) . '</option>';
+    foreach (ttl_choices() as $k => $v) $ttls .= '<option value="' . $k . '"' . option_selected('ttl', (string)$k, '172800') . '>' . h($v) . '</option>';
 
     echo layout('New request', ($err ?? '') . '
-      <h2>Raise a credential request</h2>
-      <form method="post">
+      <div class="pagehead"><h2>Raise a credential request</h2></div>
+      <div class="split">
+      <form method="post" class="card">
         <input type="hidden" name="csrf" value="' . h(csrf_token()) . '">
-        <label>FreeScout ticket number</label><input name="ticket_id" required autofocus>
-        <label>What is needed</label><select name="need">' . $opts . '</select>
-        <label>Link expires after</label><select name="ttl">' . $ttls . '</select>
+        <div class="pair">
+          <div class="field">
+            <label for="ticket_id">FreeScout ticket number</label>
+            <input id="ticket_id" name="ticket_id" required autofocus inputmode="numeric" value="' . posted_value('ticket_id') . '">
+          </div>
+          <div class="field">
+            <label for="ttl">Link expires after</label>
+            <select id="ttl" name="ttl">' . $ttls . '</select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="need">What is needed</label>
+          <select id="need" name="need">' . $opts . '</select>
+          ' . (infra_enabled()
+              ? '<p class="hint">Prefer a temporary WordPress account. Use SSH / SFTP only when there is no WordPress-level route.</p>'
+              : '') . '
+        </div>
 
-        <div class="box warn" style="margin-top:26px">
+        <div class="box warn" style="margin-top:8px">
           <strong>Before you raise this.</strong>
           <p>Asking for a credential is a last resort, not a shortcut. On a site we host, use Support Access
           and Magic Login. On a source site, the customer installs <code>instawp-connect</code> and we need
@@ -284,20 +414,37 @@ if ($path === '/new') {
           request that replaces an investigation buries a defect that will hit the next customer.</p>
         </div>
 
-        <label>Which product path failed, and how?</label>
-        <input name="failed_path" required placeholder="e.g. migration tool connect popup never opens on their source site">
-        <label>Bug reference</label>
-        <input name="bug_ref" required placeholder="task id, GitHub issue, or ClickUp link">
+        <div class="field">
+          <label for="failed_path">Which product path failed, and how?</label>
+          <input id="failed_path" name="failed_path" required placeholder="e.g. migration tool connect popup never opens on their source site" value="' . posted_value('failed_path') . '">
+        </div>
+        <div class="field">
+          <label for="bug_ref">Bug reference</label>
+          <input id="bug_ref" name="bug_ref" required placeholder="task id, GitHub issue, or ClickUp link" value="' . posted_value('bug_ref') . '">
+        </div>
 
-        <p style="margin-top:20px"><button>Generate link</button></p>
+        <p class="btn-row"><button type="submit">Generate link</button></p>
       </form>
-      ' . (infra_enabled()
-          ? '<div class="box danger"><strong>SSH collection is switched ON for this instance.</strong>
-             An SSH credential is broad, reusable, and cannot be revoked without collateral damage — and on an
-             agency ticket it is usually their client\'s server. Use it only when there is genuinely no
-             WordPress-level route, and raise the rotation with the customer yourself as well.</div>'
-          : '<p class="mut">The form offers WordPress admin and application passwords only. SSH, cPanel and FTP
-             are deliberately not options.</p>'), $staff);
+      <aside class="rail">
+        <div class="box">
+          <strong>What happens next</strong>
+          <ol class="steps">
+            <li>Customer opens the single-use link</li>
+            <li>They submit and choose view once, 1 day, or 2 days</li>
+            <li>You open it — view-once is destroyed, timed stays until expiry</li>
+            <li>You ask them to rotate access</li>
+          </ol>
+        </div>
+        ' . (infra_enabled()
+            ? '<div class="box danger"><strong>SSH / SFTP is a last resort.</strong>
+               An SSH credential is broad, reusable, and cannot be revoked without collateral damage — and on an
+               agency ticket it is usually their client\'s server. Use it only when there is genuinely no
+               WordPress-level route, and raise the rotation with the customer yourself as well.
+               cPanel and FTP are still not options.</div>'
+            : '<p class="mut">The form offers WordPress admin and application passwords only. SSH, cPanel and FTP
+               are deliberately not options.</p>') . '
+      </aside>
+      </div>', $staff);
     exit;
 }
 
@@ -310,78 +457,52 @@ if (preg_match('#^/r/(\d+)$#', $path, $m)) {
     $reveal = '';
     if ($method === 'POST' && ($_POST['action'] ?? '') === 'reveal') {
         csrf_check();
-        if ($r['status'] !== 'submitted') {
-            $reveal = '<div class="box danger">Nothing to read — this request is ' . h($r['status']) . '.</div>';
-        } else {
-            try {
-                // Order matters, in both directions.
-                //
-                // Decrypt FIRST, from the row we already fetched: if decryption fails we
-                // must not have destroyed anything, or a bad key would eat the credential.
-                $plain = unseal($r['nonce'], $r['ciphertext']);
-
-                // Then claim the read with a compare-and-set. The previous version read the
-                // status, checked it, and then wrote unconditionally -- so two engineers
-                // clicking at the same time both passed the check and both got the plaintext.
-                // "Read once" is a policy behaviour, so the guarantee has to hold under
-                // concurrency, not just in a sequential test. Only the request that actually
-                // flips the row is allowed to see the credential.
-                $won = claim_credential_read((int)$r['id'], $staff);
-
-                if (!$won) {
-                    sodium_memzero($plain);
-                    audit($staff, 'credential.read.lost_race', (int)$r['id'], $r['ticket_id']);
-                    $reveal = '<div class="box danger"><strong>Nothing to read — someone else opened this first.</strong>
+        $out = reveal_request($r, $staff);
+        if (!$out['ok']) {
+            if (!empty($out['lost_race'])) {
+                $reveal = '<div class="box danger"><strong>Nothing to read — someone else opened this first.</strong>
                       <p>It can only be opened once. Check the audit log to see who has it.</p></div>';
-                } else {
-                    audit($staff, 'credential.read', (int)$r['id'], $r['ticket_id']);
-
-                    $reveal = '<div class="box warn"><strong>Read once — now destroyed.</strong>
-                      <p>This will not be shown again. Copy what you need now, and do not paste it into the ticket.</p>'
-                      . render_credential($plain) . '</div>';
-
-                    // Deferred until after the response is sent. These are two blocking 15s
-                    // HTTP calls, and they used to run BETWEEN destroying the ciphertext and
-                    // echoing it -- so a slow FreeScout meant the engineer's request timed out
-                    // having received nothing at all, with the only copy already gone.
-                    $ticket = $r['ticket_id'];
-                    defer(fn() => freescout_note($ticket,
-                        "Automated note — secure credential handoff.\n\n" .
-                        "$staff opened the credential for this ticket on " . gmdate('Y-m-d H:i', time()) . " UTC.\n" .
-                        "The stored copy has been destroyed. It cannot be opened again.\n\n" .
-                        "When the work is done, ask the customer to change the password AND delete the application\n" .
-                        "password created for us — a password change does not revoke one."));
-
-                    // Inline: this sets rotation_flagged_at, which the re-fetch below turns
-                    // into the on-page rotation reminder. Its FreeScout call defers itself.
-                    flag_rotation((int)$r['id']);
-                }
-
-                $st->execute([(int)$m[1]]);
-                $r = $st->fetch();
-            } catch (Throwable $e) {
-                // The audit write is itself a database write, and the most likely reason we
-                // are in here is that the database is unhappy -- so this used to throw again
-                // from inside the catch and lose the very row that records the failure.
-                try { audit($staff, 'credential.read.failed', (int)$r['id'], $r['ticket_id'], $e->getMessage()); }
-                catch (Throwable $ignored) { /* nothing further we can do from here */ }
-                $reveal = '<div class="box danger"><strong>Could not decrypt.</strong><p>' . h($e->getMessage()) . '</p></div>';
+            } elseif (!empty($out['decrypt_failed'])) {
+                $reveal = '<div class="box danger"><strong>Could not decrypt.</strong><p>' . h($out['error']) . '</p></div>';
+            } else {
+                $reveal = '<div class="box danger">' . h($out['error']) . '</div>';
             }
+        } elseif (share_is_once($r)) {
+            $reveal = '<div class="box warn"><strong>Read once — now destroyed.</strong>
+                      <p>This will not be shown again. Copy what you need now, and do not paste it into the ticket.</p>'
+                      . render_credential($out['plain']) . '</div>';
+            sodium_memzero($out['plain']);
+        } else {
+            $reveal = '<div class="box warn"><strong>Still available until ' . local_time((int)$r['expires_at']) . '.</strong>
+                      <p>Copy what you need now, and do not paste it into the ticket. You can open this again until it expires.</p>'
+                      . render_credential($out['plain']) . '</div>';
+            sodium_memzero($out['plain']);
         }
+        $st->execute([(int)$m[1]]);
+        $r = $st->fetch();
     }
 
     $link   = $base . '/s/' . $r['token'];
+    $until  = local_time((int)$r['expires_at']);
     $action = match ($r['status']) {
-        'pending'   => '<div class="box"><strong>Waiting on the customer.</strong><pre>' . h($link) . '</pre>
-                        <p class="mut">Single-use link. Expires ' . h(gmdate('j M Y H:i', (int)$r['expires_at'])) . ' UTC.</p></div>',
-        'submitted' => '<form method="post"><input type="hidden" name="csrf" value="' . h(csrf_token()) . '">
-                        <input type="hidden" name="action" value="reveal">
-                        <div class="box warn"><strong>Ready to read.</strong>
-                        <p>Opening this destroys the stored copy immediately and records you as the reader. Only
-                        do it when you are ready to use it.</p>
-                        <p><button class="danger">Open once and destroy</button></p></div></form>',
+        'pending'   => '<div class="box"><strong>Waiting on the customer.</strong>
+                        <p class="hint" style="margin-bottom:10px">Copy the link, then send it to the customer.</p>
+                        ' . copyable_link($link) . '
+                        <p class="mut" style="margin-top:12px">Single-use form link. Expires ' . $until . '. The customer chooses view once, 1 day, or 2 days when they submit.</p></div>',
+        'submitted' => share_is_once($r)
+            ? '<form method="post"><input type="hidden" name="csrf" value="' . h(csrf_token()) . '">
+               <input type="hidden" name="action" value="reveal">
+               <div class="box warn"><strong>Ready to read.</strong>
+               <p>Opening this destroys the stored copy immediately and records you as the reader. Only
+               do it when you are ready to use it.</p>
+               <p class="btn-row"><button class="danger" type="submit">Open once and destroy</button></p></div></form>'
+            : '<form method="post"><input type="hidden" name="csrf" value="' . h(csrf_token()) . '">
+               <input type="hidden" name="action" value="reveal">
+               <div class="box warn"><strong>Ready to read.</strong>
+               <p>The customer asked us to keep this until ' . $until . '. You can open it again until then.</p>
+               <p class="btn-row"><button type="submit">Open</button></p></div></form>',
         'read'      => '<div class="box"><strong>Read and destroyed.</strong><p class="mut">Opened by '
-                        . h($r['read_by']) . ' on ' . h(gmdate('j M Y H:i', (int)$r['read_at'])) . ' UTC.</p></div>',
+                        . h($r['read_by']) . ' on ' . local_time((int)$r['read_at']) . '.</p></div>',
         default     => '<div class="box"><strong>Expired and purged.</strong>
                         <p class="mut">No credential is stored for this request any more.</p></div>',
     };
@@ -398,63 +519,183 @@ if (preg_match('#^/r/(\d+)$#', $path, $m)) {
                password change alone leaves our access live on their site.</p></div>');
 
     echo layout('Request #' . $r['id'],
-        '<h2>Ticket #' . h($r['ticket_id']) . '</h2>
-         <p class="mut">' . h(needs()[$r['need']] ?? $r['need']) . ' &middot; raised by ' . h($r['requested_by'])
-         . ' on ' . h(gmdate('j M Y H:i', (int)$r['created_at'])) . ' UTC</p>
+        '<div class="pagehead"><h2>Ticket #' . h($r['ticket_id']) . '</h2>' . status_pill($r['status']) . '</div>
          ' . $reveal . $action . $rot . '
+         <div class="section">
          <h2>Why this was raised</h2>
-         <table><tr><th>Product path that failed</th><td>' . h($r['failed_path']) . '</td></tr>
-         <tr><th>Bug reference</th><td>' . h($r['bug_ref']) . '</td></tr></table>
-         <p style="margin-top:24px"><a href="/">Back to requests</a></p>', $staff);
+         <dl class="meta">
+           <div><dt>Needed</dt><dd>' . h(needs()[$r['need']] ?? $r['need']) . '</dd></div>
+           <div><dt>Raised by</dt><dd>' . h($r['requested_by']) . '</dd></div>
+           <div><dt>Raised</dt><dd>' . local_time((int)$r['created_at']) . '</dd></div>
+           <div><dt>Product path that failed</dt><dd>' . h($r['failed_path']) . '</dd></div>
+           <div><dt>Bug reference</dt><dd>' . h($r['bug_ref']) . '</dd></div>
+           <div><dt>Customer asked</dt><dd>' . h(share_label($r))
+            . ($r['status'] === 'pending'
+                ? ' (they choose on the form)'
+                : (share_is_once($r) ? ' · destroyed on first open' : ' · until ' . local_time((int)$r['expires_at'])))
+            . '</dd></div>
+         </dl>
+         </div>
+         <p class="btn-row"><a class="btn btn-ghost" href="/">Back to requests</a></p>', $staff);
     exit;
 }
 
 if ($path === '/password') {
+    redirect('/settings');
+}
+
+if ($path === '/settings') {
+    $acct = staff_account($staff) ?? ['email' => $staff, 'name' => ''];
+    $nameVal = posted_value('name') !== '' ? posted_value('name') : h(trim((string)($acct['name'] ?? '')));
+    $emailVal = posted_value('email') !== '' ? posted_value('email') : h((string)$acct['email']);
+    $flash = '';
+
     if ($method === 'POST') {
         csrf_check();
-        $cur  = (string)($_POST['current'] ?? '');
-        $new  = (string)($_POST['new'] ?? '');
-        $conf = (string)($_POST['confirm'] ?? '');
-        $st = db()->prepare("SELECT pass_hash FROM staff WHERE email = ?");
-        $st->execute([$staff]);
-        $row = $st->fetch();
-        if (!$row || !password_verify($cur, $row['pass_hash'])) {
-            $err = '<div class="box danger">Your current password is wrong.</div>';
-        } elseif (strlen($new) < 12) {
-            $err = '<div class="box danger">Use at least 12 characters.</div>';
-        } elseif (!hash_equals($new, $conf)) {
-            $err = '<div class="box danger">The two new passwords do not match.</div>';
+        $intent = (string)($_POST['intent'] ?? '');
+        $cur = (string)($_POST['current'] ?? '');
+
+        if ($intent === 'profile') {
+            $name = trim((string)($_POST['name'] ?? ''));
+            $email = strtolower(trim((string)($_POST['email'] ?? '')));
+            $nameVal = h($name);
+            $emailVal = h($email);
+            if ($name === '' || strlen($name) > 80) {
+                $flash = '<div class="box danger">Name is required and must be 80 characters or fewer.</div>';
+            } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $flash = '<div class="box danger">Enter a valid email address.</div>';
+            } elseif (!staff_verify_password($staff, $cur)) {
+                $flash = '<div class="box danger">Your current password is wrong.</div>';
+            } else {
+                $dup = db()->prepare("SELECT 1 FROM staff WHERE email = ? AND email != ?");
+                $dup->execute([$email, $staff]);
+                if ($dup->fetchColumn()) {
+                    $flash = '<div class="box danger">That email is already in use.</div>';
+                } else {
+                    try {
+                        db()->prepare("UPDATE staff SET name = ?, email = ? WHERE email = ?")
+                            ->execute([$name, $email, $staff]);
+                    } catch (PDOException $e) {
+                        $flash = '<div class="box danger">That email is already in use.</div>';
+                    }
+                    if ($flash === '') {
+                        $detail = $email !== $staff ? "email $staff → $email" : null;
+                        audit($email, 'staff.profile.updated', null, null, $detail);
+                        if ($email !== $staff) {
+                            session_start_secure();
+                            $_SESSION['staff_email'] = $email;
+                            $staff = $email;
+                        }
+                        $acct = staff_account($staff) ?? $acct;
+                        $nameVal = h(trim((string)($acct['name'] ?? '')));
+                        $emailVal = h((string)$acct['email']);
+                        $flash = '<div class="box ok"><strong>Profile saved.</strong></div>';
+                    }
+                }
+            }
+        } elseif ($intent === 'password') {
+            $new  = (string)($_POST['new'] ?? '');
+            $conf = (string)($_POST['confirm'] ?? '');
+            if (!staff_verify_password($staff, $cur)) {
+                $flash = '<div class="box danger">Your current password is wrong.</div>';
+            } elseif (strlen($new) < 12) {
+                $flash = '<div class="box danger">Use at least 12 characters.</div>';
+            } elseif (!hash_equals($new, $conf)) {
+                $flash = '<div class="box danger">The two new passwords do not match.</div>';
+            } else {
+                db()->prepare("UPDATE staff SET pass_hash = ? WHERE email = ?")
+                    ->execute([password_hash($new, PASSWORD_BCRYPT, ['cost' => 12]), $staff]);
+                audit($staff, 'staff.password.changed');
+                $flash = '<div class="box ok"><strong>Password changed.</strong></div>';
+            }
         } else {
-            db()->prepare("UPDATE staff SET pass_hash = ? WHERE email = ?")
-                ->execute([password_hash($new, PASSWORD_BCRYPT, ['cost' => 12]), $staff]);
-            audit($staff, 'staff.password.changed');
-            $err = '<div class="box"><strong>Password changed.</strong></div>';
+            $flash = '<div class="box danger">Unknown action.</div>';
         }
     }
-    echo layout('Change password', ($err ?? '') . '
-      <h2>Change your password</h2>
-      <form method="post" style="max-width:380px">
-        <input type="hidden" name="csrf" value="' . h(csrf_token()) . '">
-        <label>Current password</label><input name="current" type="password" required>
-        <label>New password (12+ characters)</label><input name="new" type="password" required>
-        <label>Confirm new password</label><input name="confirm" type="password" required>
-        <p style="margin-top:18px"><button>Change password</button></p>
-      </form>', $staff);
+
+    echo layout('Settings', $flash . '
+      <div class="pagehead"><h2>Settings</h2></div>
+      <p class="lede">Your name is shown to other staff. Email is how you sign in. Changing either needs your current password.</p>
+      <div class="settings">
+        <form method="post" class="card" autocomplete="off">
+          <h2>Profile</h2>
+          <input type="hidden" name="csrf" value="' . h(csrf_token()) . '">
+          <input type="hidden" name="intent" value="profile">
+          <div class="field">
+            <label for="name">Name</label>
+            <input id="name" name="name" type="text" required maxlength="80" autocomplete="name" value="' . $nameVal . '">
+          </div>
+          <div class="field">
+            <label for="email">Email</label>
+            <input id="email" name="email" type="email" required autocomplete="username" value="' . $emailVal . '">
+          </div>
+          <div class="field">
+            <label for="profile-current">Current password</label>
+            <input id="profile-current" name="current" type="password" required autocomplete="current-password">
+            <p class="hint">Required to save name or email.</p>
+          </div>
+          <p class="btn-row"><button type="submit">Save profile</button></p>
+        </form>
+        <form method="post" class="card">
+          <h2>Password</h2>
+          <input type="hidden" name="csrf" value="' . h(csrf_token()) . '">
+          <input type="hidden" name="intent" value="password">
+          <div class="field">
+            <label for="current">Current password</label>
+            <input id="current" name="current" type="password" required autocomplete="current-password">
+          </div>
+          <div class="field">
+            <label for="new">New password (12+ characters)</label>
+            <input id="new" name="new" type="password" required minlength="12" autocomplete="new-password">
+          </div>
+          <div class="field">
+            <label for="confirm">Confirm new password</label>
+            <input id="confirm" name="confirm" type="password" required minlength="12" autocomplete="new-password">
+          </div>
+          <p class="btn-row"><button type="submit">Update password</button></p>
+        </form>
+      </div>', $staff);
     exit;
 }
 
 if ($path === '/audit') {
-    $rows = db()->query("SELECT * FROM audit ORDER BY id DESC LIMIT 300")->fetchAll();
-    $body = '<h2>Audit</h2><p class="mut">Every read is recorded here and cannot be edited from the UI.</p><div class="scroll"><table>
-             <tr><th>When (UTC)</th><th>Who</th><th>Action</th><th>Ticket</th><th>IP</th><th>Detail</th></tr>';
+    $per   = 15;
+    $total = (int)db()->query("SELECT COUNT(*) FROM audit")->fetchColumn();
+    $pages = max(1, (int)ceil($total / $per));
+    $page  = (int)($_GET['page'] ?? 1);
+    if ($page < 1) $page = 1;
+    if ($page > $pages) $page = $pages;
+    $off = ($page - 1) * $per;
+    $rows = db()->query("SELECT * FROM audit ORDER BY id DESC LIMIT {$per} OFFSET {$off}")->fetchAll();
+
+    $from = $total === 0 ? 0 : $off + 1;
+    $to   = $off + count($rows);
+    $prev = $page > 1
+        ? '<a class="btn btn-ghost" href="/audit?page=' . ($page - 1) . '">Previous</a>'
+        : '<span class="btn btn-ghost off" aria-disabled="true">Previous</span>';
+    $next = $page < $pages
+        ? '<a class="btn btn-ghost" href="/audit?page=' . ($page + 1) . '">Next</a>'
+        : '<span class="btn btn-ghost off" aria-disabled="true">Next</span>';
+    $pager = $total === 0 ? ''
+        : '<div class="pager"><p class="mut">Showing ' . $from . '–' . $to . ' of ' . $total
+          . ' · page ' . $page . ' of ' . $pages . '</p>'
+          . '<p class="btn-row">' . $prev . $next . '</p></div>';
+
+    $body = '<div class="pagehead"><h2>Audit</h2></div>
+             <p class="lede">Every read is recorded here and cannot be edited from the UI. Newest first, 15 per page.</p>
+             <div class="scroll"><table>
+             <thead><tr><th scope="col">When</th><th scope="col">Who</th><th scope="col">Action</th><th scope="col">Ticket</th><th scope="col">IP</th><th scope="col">Detail</th></tr></thead><tbody>';
     foreach ($rows as $a) {
-        $body .= '<tr><td>' . h(gmdate('j M H:i', (int)$a['at'])) . '</td><td>' . h($a['actor'])
-              . '</td><td><code>' . h($a['action']) . '</code></td><td>' . h($a['ticket_id'])
-              . '</td><td class="mut">' . h($a['ip']) . '</td><td class="mut">' . h($a['detail']) . '</td></tr>';
+        $hot = $a['action'] === 'credential.read' ? ' class="row-ready"' : '';
+        $body .= '<tr' . $hot . '><td>' . local_time((int)$a['at'], 'short') . '</td><td>' . h($a['actor'])
+              . '</td><td title="' . h($a['action']) . '">' . h(audit_label((string)$a['action'])) . '</td><td>' . h($a['ticket_id'])
+              . '</td><td class="mut">' . h($a['ip']) . '</td><td class="mut" title="' . h((string)$a['detail']) . '">'
+              . h(audit_detail_label((string)$a['action'], $a['detail'] !== null ? (string)$a['detail'] : null)) . '</td></tr>';
     }
-    echo layout('Audit', $body . '</table></div>', $staff);
+    if (!$rows) $body .= '<tr><td colspan="6"><div class="empty"><strong>No audit rows yet.</strong></div></td></tr>';
+    echo layout('Audit', $body . '</tbody></table></div>' . $pager, $staff);
     exit;
 }
 
 http_response_code(404);
-echo layout('Not found', '<div class="box">No such page.</div>', $staff);
+echo layout('Not found', '<div class="box">No such page.</div><p class="btn-row"><a class="btn btn-ghost" href="/">Back to requests</a></p>', $staff);

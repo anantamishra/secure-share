@@ -59,3 +59,24 @@ function flag_rotation(int $id): void {
     $body   = implode("\n", $lines);
     defer(fn() => freescout_note($ticket, $body));
 }
+
+/**
+ * Expire and purge anything past its deadline. Shared by the web sweep and cron
+ * so the unused-link nag guard cannot drift between the two again.
+ */
+function purge_expired(string $actor = 'system'): int {
+    $pdo = db();
+    $st  = $pdo->prepare("SELECT * FROM requests WHERE expires_at < ? AND status IN ('pending','submitted','read')");
+    $st->execute([time()]);
+    $n = 0;
+    foreach ($st->fetchAll() as $r) {
+        $pdo->prepare("UPDATE requests SET status='expired', purged_at=?, nonce=NULL, ciphertext=NULL WHERE id=?")
+            ->execute([time(), $r['id']]);
+        audit($actor, 'request.expired.purged', (int)$r['id'], $r['ticket_id']);
+        // Only nag when the customer actually sent something. An expired PENDING
+        // link must not tell them to rotate a password they never submitted.
+        if ($r['submitted_at'] !== null) flag_rotation((int)$r['id']);
+        $n++;
+    }
+    return $n;
+}
