@@ -17,7 +17,11 @@ foreach ($st->fetchAll() as $r) {
     $pdo->prepare("UPDATE requests SET status='expired', purged_at=?, nonce=NULL, ciphertext=NULL WHERE id=?")
         ->execute([time(), $r['id']]);
     audit('cron', 'request.expired.purged', (int)$r['id'], $r['ticket_id']);
-    flag_rotation((int)$r['id']);
+    // Only nag when the customer actually sent something. The web sweep has always had
+    // this guard and this one did not, so an expired PENDING link produced a note telling
+    // the customer to rotate a password they never submitted -- and asserting we had it.
+    // False nags are how staff learn to ignore the real ones.
+    if ($r['submitted_at'] !== null) flag_rotation((int)$r['id']);
     $n++;
 }
 echo "purged $n\n";

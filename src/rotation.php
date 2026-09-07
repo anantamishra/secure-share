@@ -46,7 +46,16 @@ function flag_rotation(int $id): void {
         'If it came from an agency, the end client should be told it was disclosed. They are the data',
         'subject and they are not in this thread.',
     ];
-    freescout_note($r['ticket_id'], implode("\n", $lines));
+    // Mark and audit SYNCHRONOUSLY. This flag is what makes the rotation nag render on
+    // the reveal page, so deferring it would quietly remove the reminder the engineer is
+    // supposed to act on -- the nag is a policy behaviour, not a notification detail.
     $pdo->prepare("UPDATE requests SET rotation_flagged_at=? WHERE id=?")->execute([time(), $id]);
     audit('system', 'rotation.flagged', $id, $r['ticket_id']);
+
+    // Only the outbound HTTP call is deferred: it is a 15s-timeout request to a third
+    // party, and it used to run while the engineer was still waiting for the plaintext.
+    // Flagging does not depend on the note succeeding -- it never did.
+    $ticket = $r['ticket_id'];
+    $body   = implode("\n", $lines);
+    defer(fn() => freescout_note($ticket, $body));
 }

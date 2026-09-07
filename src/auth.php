@@ -13,7 +13,10 @@ function session_start_secure(): void {
     session_set_cookie_params([
         'lifetime' => 0,
         'path'     => '/',
-        'secure'   => (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
+        // Driven by our own configured APP_URL as well as the request, so the flag does
+        // not silently drop if the proxy ever stops sending X-Forwarded-Proto.
+        'secure'   => str_starts_with((string)cfg('APP_URL', ''), 'https://')
+                      || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
                       || (($_SERVER['HTTPS'] ?? '') === 'on'),
         'httponly' => true,
         'samesite' => 'Lax',
@@ -22,14 +25,39 @@ function session_start_secure(): void {
     session_start();
 }
 
+/** Staff sessions expire on their own. Session files here are never garbage-collected
+ *  (gc_probability is 0 on Debian/Ubuntu and the distro sweeper only looks at the ini
+ *  path, not our DATA_DIR/sessions), so without this a session file is immortal. */
+const STAFF_SESSION_MAX_AGE = 43200; // 12 hours
+
 function current_staff(): ?string {
     session_start_secure();
-    return $_SESSION['staff_email'] ?? null;
+    $email = $_SESSION['staff_email'] ?? null;
+    if ($email === null) return null;
+    $since = (int)($_SESSION['login_at'] ?? 0);
+    if ($since <= 0 || (time() - $since) > STAFF_SESSION_MAX_AGE) {
+        staff_logout();
+        return null;
+    }
+    return $email;
 }
 
+/**
+ * Every staff page goes through here, so this is the only place that can notice a
+ * member has been offboarded. It re-checks `active` on each request: checking it at
+ * login only meant `bin/staff.php disable` did nothing to anyone already signed in,
+ * and their session then never expired either.
+ */
 function require_staff(): string {
     $e = current_staff();
     if ($e === null) redirect('/login');
+    $st = db()->prepare("SELECT 1 FROM staff WHERE email = ? AND active = 1");
+    $st->execute([$e]);
+    if (!$st->fetchColumn()) {
+        audit($e, 'staff.session.revoked');
+        staff_logout();
+        redirect('/login');
+    }
     return $e;
 }
 
@@ -44,6 +72,7 @@ function staff_login(string $email, string $password): bool {
     session_start_secure();
     session_regenerate_id(true);
     $_SESSION['staff_email'] = $row['email'];
+    $_SESSION['login_at']    = time();
     return true;
 }
 

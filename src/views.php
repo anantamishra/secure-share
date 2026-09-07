@@ -83,8 +83,8 @@ function layout(string $title, string $body, ?string $staff = null): string {
   tbody tr:hover{background:var(--mint-tint)}
   .box{border:1px solid var(--line);border-radius:11px;padding:15px 17px;margin:16px 0;
        background:var(--panel);box-shadow:var(--shadow)}
-  .warn{background:var(--warnbg);border-color:var(--warn);color:var(--warn);box-shadow:none}
-  .danger{background:var(--dangbg);border-color:var(--dang);color:var(--dang);box-shadow:none}
+  .warn{background:var(--warnbg);border-color:var(--warn);color:var(--warn)}
+  .danger{background:var(--dangbg);border-color:var(--dang);color:var(--dang)}
   code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
   pre{background:var(--mint-tint);border:1px solid var(--line);padding:12px;border-radius:8px;
       overflow-x:auto;white-space:pre-wrap;word-break:break-all}

@@ -97,6 +97,10 @@ function db(): PDO {
     ]);
     $pdo->exec('PRAGMA journal_mode=WAL');
     $pdo->exec('PRAGMA foreign_keys=ON');
+    // Concurrent readers/writers are normal here (two engineers, cron, the customer).
+    // Without this SQLite throws "database is locked" immediately, which used to take
+    // the audit write down with it -- see the failure handler in public/index.php.
+    $pdo->exec('PRAGMA busy_timeout=5000');
     migrate($pdo);
     return $pdo;
 }
@@ -152,11 +156,87 @@ function audit(string $actor, string $action, ?int $reqId = null, ?string $ticke
     $st->execute([time(), $actor, $action, $reqId, $ticket, client_ip(), $detail]);
 }
 
+/**
+ * The caller's IP, used to key the login throttle and to fill the audit trail.
+ *
+ * X-Forwarded-For is attacker-controlled unless the request actually came from our
+ * own proxy, so it is honoured ONLY when REMOTE_ADDR is a trusted proxy. Taking the
+ * leftmost entry -- the previous behaviour -- let anyone forge it and rotate it, which
+ * made the login throttle a no-op and the audit ip column attacker-chosen.
+ *
+ * We take the RIGHTMOST entry, not the leftmost: nginx's $proxy_add_x_forwarded_for
+ * APPENDS the peer address to whatever the client already sent, so the last hop is the
+ * only one our proxy vouches for. Everything to the left of it is client-supplied.
+ */
 function client_ip(): string {
-    foreach (['HTTP_X_FORWARDED_FOR', 'REMOTE_ADDR'] as $k) {
-        if (!empty($_SERVER[$k])) return trim(explode(',', $_SERVER[$k])[0]);
+    $remote = (string)($_SERVER['REMOTE_ADDR'] ?? '');
+    if ($remote === '') return 'cli';
+
+    // Defaults to EMPTY on purpose: fail closed. Behind nginx->php-fpm REMOTE_ADDR is
+    // 127.0.0.1 for every request, so defaulting to trusting loopback would trust a
+    // forged X-Forwarded-For from anyone -- which is the bug this function exists to fix.
+    // Set TRUSTED_PROXIES only after confirming the proxy APPENDS (nginx's
+    // $proxy_add_x_forwarded_for); we then take the rightmost hop, the only one it vouches
+    // for. If it is unset, the per-account login throttle is the meaningful limit, since
+    // every request looks like it comes from the proxy.
+    $trusted = array_filter(array_map('trim', explode(',', (string)cfg('TRUSTED_PROXIES', ''))));
+    if (in_array($remote, $trusted, true) && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $hops = array_filter(array_map('trim', explode(',', (string)$_SERVER['HTTP_X_FORWARDED_FOR'])));
+        $last = $hops ? end($hops) : false;
+        if ($last !== false && filter_var($last, FILTER_VALIDATE_IP)) return $last;
     }
-    return 'cli';
+    return $remote;
+}
+
+/**
+ * Claim the single read of a credential. Returns true for the ONE caller that wins.
+ *
+ * This is the whole of the "read once" guarantee. It must stay a compare-and-set: the
+ * caller's earlier status check is only an optimisation, and two requests can both pass
+ * it before either writes. Extracted from the route so it can be falsified directly --
+ * through HTTP the pre-check masks a missing guard and the test passes either way.
+ */
+function claim_credential_read(int $id, string $staff): bool {
+    $st = db()->prepare("UPDATE requests SET status='read', read_at=?, read_by=?, nonce=NULL, ciphertext=NULL
+                         WHERE id=? AND status='submitted'");
+    $st->execute([time(), $staff, $id]);
+    return $st->rowCount() === 1;
+}
+
+/**
+ * Defer work until after the response has been sent.
+ *
+ * The reveal path used to destroy the ciphertext and then make two blocking 15s
+ * FreeScout calls BEFORE echoing the plaintext, so a slow or unreachable FreeScout
+ * meant the engineer got zero bytes while the only copy of the credential was already
+ * gone. Anything that talks to a third party belongs here, after the bytes are out.
+ */
+function defer(callable $fn): void {
+    // Self-registering: bin/sweep.php is a second entrypoint and would otherwise queue
+    // work that nothing ever drains.
+    if (empty($GLOBALS['__deferred']) && empty($GLOBALS['__deferred_registered'])) {
+        $GLOBALS['__deferred_registered'] = true;
+        register_shutdown_function('run_deferred');
+    }
+    $GLOBALS['__deferred'][] = $fn;
+}
+
+function run_deferred(): void {
+    $queue = $GLOBALS['__deferred'] ?? [];
+    $GLOBALS['__deferred'] = [];
+    if (!$queue) return;
+    // Release the client first, then do the slow work.
+    if (function_exists('fastcgi_finish_request')) {
+        @fastcgi_finish_request();
+    } else {
+        while (ob_get_level() > 0) @ob_end_flush();
+        @flush();
+    }
+    foreach ($queue as $fn) {
+        // Best effort by definition: the response is already sent, so a failure here
+        // must never surface as a broken page.
+        try { $fn(); } catch (Throwable $e) { /* deliberately swallowed */ }
+    }
 }
 
 /** Bounded attempts per key within a window. Returns false when over the limit. */

@@ -9,6 +9,17 @@ require __DIR__ . '/../src/views.php';
 require __DIR__ . '/../src/freescout.php';
 require __DIR__ . '/../src/rotation.php';
 
+// Without this an uncaught throwable renders a blank page (or, if the pod ever has
+// zend.exception_ignore_args=Off, a stack trace whose frames include the plaintext
+// credential and the master key). Neither is acceptable on this app.
+set_exception_handler(function (Throwable $e): void {
+    if (!headers_sent()) { http_response_code(500); header('Content-Type: text/plain'); }
+    try { audit('system', 'unhandled.exception', null, null, get_class($e) . ': ' . $e->getMessage()); }
+    catch (Throwable $ignored) { /* the DB is the thing that failed; do not mask it */ }
+    echo "Something went wrong and has been logged.\n"
+       . "If you were opening a credential, check the request page before asking the customer again:\n"
+       . "it may already have been marked read.\n";
+});
 header('X-Frame-Options: DENY');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: no-referrer');
@@ -31,6 +42,8 @@ function sweep(): void {
         $pdo->prepare("UPDATE requests SET status='expired', purged_at=?, nonce=NULL, ciphertext=NULL WHERE id=?")
             ->execute([time(), $r['id']]);
         audit('system', 'request.expired.purged', (int)$r['id'], $r['ticket_id']);
+        // flag_rotation() marks locally and defers its own FreeScout call, so this is
+        // safe to run inline even though the sweep fires on every request.
         if ($r['submitted_at'] !== null) flag_rotation((int)$r['id']);
     }
 }
@@ -78,15 +91,26 @@ if (preg_match('#^/s/([a-f0-9]{48})$#', $path, $m)) {
         if ($missing) {
             $err = '<div class="box danger">Every field except Notes' . ($optional ? ' and Port' : '') . ' is required.</div>';
         } else {
-            [$nonce, $ct] = seal(json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
-            db()->prepare("UPDATE requests SET status='submitted', submitted_at=?, nonce=?, ciphertext=?, site_url=? WHERE id=?")
-                ->execute([time(), $nonce, $ct, $payload[$fields[array_key_first($fields)]], $r['id']]);
+            // JSON_INVALID_UTF8_SUBSTITUTE: json_encode() returns false on invalid UTF-8,
+            // and seal(false) then fatals under strict_types -- the customer's submission
+            // was silently lost and the row stayed pending, so they retried into the same
+            // failure. Substituting keeps the field readable rather than dropping it.
+            $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+            [$nonce, $ct] = seal((string)$json);
+            // Guarded on status: a submit racing the expiry sweep would otherwise write
+            // ciphertext back onto a row that had just been purged, and a double-submit
+            // would overwrite the first payload.
+            $upd = db()->prepare("UPDATE requests SET status='submitted', submitted_at=?, nonce=?, ciphertext=?, site_url=? WHERE id=? AND status='pending'");
+            $upd->execute([time(), $nonce, $ct, $payload[$fields[array_key_first($fields)]], $r['id']]);
+            if ($upd->rowCount() !== 1) {
+                http_response_code(410); $gone('It has already been used.'); exit;
+            }
             audit('customer', 'credential.submitted', (int)$r['id'], $r['ticket_id']);
-            freescout_note($r['ticket_id'],
+            defer(fn() => freescout_note($r['ticket_id'],
                 "Automated note — secure credential handoff.\n\n" .
                 "The customer has submitted credentials through the secure form.\n" .
                 "Read them at: {$GLOBALS['base']}/r/{$r['id']}\n\n" .
-                "They are readable ONCE, then destroyed. Expires " . gmdate('Y-m-d H:i', (int)$r['expires_at']) . " UTC.");
+                "They are readable ONCE, then destroyed. Expires " . gmdate('Y-m-d H:i', (int)$r['expires_at']) . " UTC."));
             echo layout('Received',
                 '<div class="box"><strong>Thank you — received.</strong>
                  <p>Your details are encrypted and can be opened once by the engineer working your ticket, then destroyed automatically.</p></div>
@@ -114,10 +138,14 @@ if (preg_match('#^/s/([a-f0-9]{48})$#', $path, $m)) {
         $r['need'] === 'ssh' => '<div class="box danger"><strong>Please change this password once we are done.</strong>
             Server credentials usually unlock more than one site, so treat anything you send here as disclosed.
             We will remind you on the ticket as well.</div>',
-        infra_enabled() => '<p class="mut">We will never ask you for cPanel or FTP credentials. If anyone
-            claiming to be from InstaWP asks for those, please tell us.</p>',
-        default => '<p class="mut">We will never ask you for SSH, cPanel or FTP credentials. If anyone
-            claiming to be from InstaWP asks for those, please tell us.</p>',
+        // Given its own box rather than muted small print: this single line is the whole
+        // anti-phishing affordance, and it was previously the least prominent text on the
+        // page. Wording is unchanged and still flag-aware -- it may only name what this
+        // instance genuinely never asks for.
+        infra_enabled() => '<div class="box"><strong>We will never ask you for cPanel or FTP credentials.</strong>
+            If anyone claiming to be from InstaWP asks for those, please tell us.</div>',
+        default => '<div class="box"><strong>We will never ask you for SSH, cPanel or FTP credentials.</strong>
+            If anyone claiming to be from InstaWP asks for those, please tell us.</div>',
     };
 
     $inputs = '';
@@ -154,7 +182,11 @@ if ($path === '/login') {
     if ($method === 'POST') {
         csrf_check();
         $email = (string)($_POST['email'] ?? '');
-        if (!throttle_ok('login:' . client_ip(), 10, 900)) {
+        // Two independent buckets. The per-IP one stops one host grinding away; the
+        // per-account one stops a distributed attempt at a single known staff address,
+        // which the IP bucket alone cannot see.
+        if (!throttle_ok('login:' . client_ip(), 10, 900)
+            || !throttle_ok('login-acct:' . strtolower(trim($email)), 10, 900)) {
             http_response_code(429); exit('Too many attempts. Wait 15 minutes.');
         }
         if (staff_login($email, (string)($_POST['password'] ?? ''))) {
@@ -282,24 +314,57 @@ if (preg_match('#^/r/(\d+)$#', $path, $m)) {
             $reveal = '<div class="box danger">Nothing to read — this request is ' . h($r['status']) . '.</div>';
         } else {
             try {
+                // Order matters, in both directions.
+                //
+                // Decrypt FIRST, from the row we already fetched: if decryption fails we
+                // must not have destroyed anything, or a bad key would eat the credential.
                 $plain = unseal($r['nonce'], $r['ciphertext']);
-                db()->prepare("UPDATE requests SET status='read', read_at=?, read_by=?, nonce=NULL, ciphertext=NULL WHERE id=?")
-                    ->execute([time(), $staff, $r['id']]);
-                audit($staff, 'credential.read', (int)$r['id'], $r['ticket_id']);
-                freescout_note($r['ticket_id'],
-                    "Automated note — secure credential handoff.\n\n" .
-                    "$staff opened the credential for this ticket on " . gmdate('Y-m-d H:i', time()) . " UTC.\n" .
-                    "The stored copy has been destroyed. It cannot be opened again.\n\n" .
-                    "When the work is done, ask the customer to change the password AND delete the application\n" .
-                    "password created for us — a password change does not revoke one.");
-                flag_rotation((int)$r['id']);
-                $reveal = '<div class="box warn"><strong>Read once — now destroyed.</strong>
-                  <p>This will not be shown again. Copy what you need now, and do not paste it into the ticket.</p>'
-                  . render_credential($plain) . '</div>';
+
+                // Then claim the read with a compare-and-set. The previous version read the
+                // status, checked it, and then wrote unconditionally -- so two engineers
+                // clicking at the same time both passed the check and both got the plaintext.
+                // "Read once" is a policy behaviour, so the guarantee has to hold under
+                // concurrency, not just in a sequential test. Only the request that actually
+                // flips the row is allowed to see the credential.
+                $won = claim_credential_read((int)$r['id'], $staff);
+
+                if (!$won) {
+                    sodium_memzero($plain);
+                    audit($staff, 'credential.read.lost_race', (int)$r['id'], $r['ticket_id']);
+                    $reveal = '<div class="box danger"><strong>Nothing to read — someone else opened this first.</strong>
+                      <p>It can only be opened once. Check the audit log to see who has it.</p></div>';
+                } else {
+                    audit($staff, 'credential.read', (int)$r['id'], $r['ticket_id']);
+
+                    $reveal = '<div class="box warn"><strong>Read once — now destroyed.</strong>
+                      <p>This will not be shown again. Copy what you need now, and do not paste it into the ticket.</p>'
+                      . render_credential($plain) . '</div>';
+
+                    // Deferred until after the response is sent. These are two blocking 15s
+                    // HTTP calls, and they used to run BETWEEN destroying the ciphertext and
+                    // echoing it -- so a slow FreeScout meant the engineer's request timed out
+                    // having received nothing at all, with the only copy already gone.
+                    $ticket = $r['ticket_id'];
+                    defer(fn() => freescout_note($ticket,
+                        "Automated note — secure credential handoff.\n\n" .
+                        "$staff opened the credential for this ticket on " . gmdate('Y-m-d H:i', time()) . " UTC.\n" .
+                        "The stored copy has been destroyed. It cannot be opened again.\n\n" .
+                        "When the work is done, ask the customer to change the password AND delete the application\n" .
+                        "password created for us — a password change does not revoke one."));
+
+                    // Inline: this sets rotation_flagged_at, which the re-fetch below turns
+                    // into the on-page rotation reminder. Its FreeScout call defers itself.
+                    flag_rotation((int)$r['id']);
+                }
+
                 $st->execute([(int)$m[1]]);
                 $r = $st->fetch();
             } catch (Throwable $e) {
-                audit($staff, 'credential.read.failed', (int)$r['id'], $r['ticket_id'], $e->getMessage());
+                // The audit write is itself a database write, and the most likely reason we
+                // are in here is that the database is unhappy -- so this used to throw again
+                // from inside the catch and lose the very row that records the failure.
+                try { audit($staff, 'credential.read.failed', (int)$r['id'], $r['ticket_id'], $e->getMessage()); }
+                catch (Throwable $ignored) { /* nothing further we can do from here */ }
                 $reveal = '<div class="box danger"><strong>Could not decrypt.</strong><p>' . h($e->getMessage()) . '</p></div>';
             }
         }
