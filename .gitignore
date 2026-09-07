@@ -1,0 +1,8 @@
+# Never commit runtime state or config — APP_KEY and the credential store live
+# outside the checkout on purpose (see README).
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+handoff.env
+.env
+data/
