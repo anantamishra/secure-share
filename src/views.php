@@ -200,6 +200,16 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
         background-repeat:no-repeat;background-position:right 12px center;padding-right:32px}
   input:hover,select:hover,textarea:hover{border-color:color-mix(in srgb,var(--mint) 45%, var(--line))}
   input:focus,select:focus,textarea:focus{outline:0;border-color:var(--mint);box-shadow:0 0 0 4px var(--ring)}
+  .password-control{position:relative}
+  .password-control input{padding-right:48px}
+  .password-toggle{position:absolute;right:6px;top:50%;width:36px;height:36px;min-width:0;padding:0;
+        transform:translateY(-50%);background:transparent;color:var(--mut);border:0;box-shadow:none}
+  .password-toggle:hover,.password-toggle:active{background:var(--mint-soft);color:var(--brand);transform:translateY(-50%)}
+  .password-toggle:focus-visible{box-shadow:0 0 0 3px var(--ring);outline:0}
+  .password-toggle svg{display:block}
+  .password-toggle .password-eye-off{display:none}
+  .password-toggle[aria-pressed="true"] .password-eye{display:none}
+  .password-toggle[aria-pressed="true"] .password-eye-off{display:block}
   .share{border:1px solid var(--line);border-radius:10px;padding:10px 14px 12px;margin:4px 0 16px}
   .share legend{font-weight:700;font-size:13px;padding:0 4px;color:var(--brand-900)}
   .share label{display:flex;align-items:center;gap:10px;font-weight:500;margin:8px 0;cursor:pointer}
@@ -266,6 +276,8 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
   th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);font-weight:700}
   tbody tr:last-child td{border-bottom:0}
   tbody tr:hover{background:var(--mint-tint)}
+  tbody tr[data-href]{cursor:pointer}
+  tbody tr[data-href] td.row-act{cursor:default}
   tbody tr.row-ready{background:color-mix(in srgb, var(--okbg) 70%, var(--panel))}
   tbody tr.row-ready:hover{background:var(--okbg)}
   a.rowlink{font-weight:700;color:var(--brand-900);text-decoration:none;letter-spacing:-.01em}
@@ -361,6 +373,16 @@ document.querySelectorAll("time.localtime").forEach(function(el){
   if(fmt!=="short")opts.year="numeric";
   try{el.textContent=d.toLocaleString(undefined,opts)}catch(e){}
 });
+document.querySelectorAll(".password-toggle").forEach(function(btn){
+  btn.addEventListener("click",function(){
+    var input=btn.parentElement.querySelector("input");
+    var shown=btn.getAttribute("aria-pressed")==="true";
+    if(!input)return;
+    input.type=shown?"password":"text";
+    btn.setAttribute("aria-pressed",shown?"false":"true");
+    btn.setAttribute("aria-label",shown?"Show password":"Hide password");
+  });
+});
 ' . ($staff === null ? '' : '
 document.querySelectorAll("form[data-confirm]").forEach(function(f){
   f.addEventListener("submit",function(e){
@@ -370,6 +392,22 @@ document.querySelectorAll("form[data-confirm]").forEach(function(f){
       ?"Expire this request now? Any stored credential is destroyed. The row stays as expired."
       :"Delete this request? Any stored credential is destroyed.";
     if(!confirm(msg))e.preventDefault();
+  });
+});
+document.querySelectorAll("tr[data-href]").forEach(function(tr){
+  tr.addEventListener("click",function(e){
+    if(e.defaultPrevented||e.button!==0)return;
+    // The Actions cell submits the surrounding form (expire/delete), and the ticket
+    // cell already holds a real link -- leave both to their own handlers.
+    var t=e.target;
+    if(t&&t.closest&&t.closest(".row-act,a,button,input,select,textarea,label"))return;
+    // Engineers copy ticket ids and emails straight out of these cells; a drag that
+    // ends in a selection is not a click on the row.
+    var sel=window.getSelection();
+    if(sel&&sel.toString().length)return;
+    var url=tr.getAttribute("data-href");
+    if(e.metaKey||e.ctrlKey||e.shiftKey){window.open(url,"_blank","noopener");return}
+    location.href=url;
   });
 });
 document.querySelectorAll("[data-copy]").forEach(function(btn){
@@ -488,6 +526,25 @@ function copy_button(string $targetId): string {
          . '</svg>'
          . '<svg class="copy-ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
          . '<path d="M20 6L9 17l-5-5"></path>'
+         . '</svg>'
+         . '</button>';
+}
+
+/**
+ * Reveal control for a password input. The customer is transcribing a credential
+ * they created moments ago on another site, and a typo is only discoverable here --
+ * once submitted the value is encrypted and nobody can read it back to them.
+ */
+function password_toggle_button(): string {
+    return '<button type="button" class="password-toggle" aria-label="Show password" aria-pressed="false">'
+         . '<svg class="password-eye" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+         . '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"></path>'
+         . '<circle cx="12" cy="12" r="3"></circle>'
+         . '</svg>'
+         . '<svg class="password-eye-off" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+         . '<path d="m3 3 18 18"></path>'
+         . '<path d="M10.6 10.6a2 2 0 0 0 2.8 2.8"></path>'
+         . '<path d="M9.9 4.2A10.6 10.6 0 0 1 12 4c6.5 0 10 8 10 8a18.4 18.4 0 0 1-3.1 4.3M6.6 6.6C3.7 8.6 2 12 2 12s3.5 8 10 8c1.5 0 2.9-.4 4.1-1"></path>'
          . '</svg>'
          . '</button>';
 }
