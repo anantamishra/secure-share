@@ -8,7 +8,7 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
     $audience = $opt['audience'] ?? ($staff !== null ? 'staff' : 'guest');
     $here = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
     $on = function (string $href) use ($here): string {
-        $active = $here === $href || ($href === '/' && (bool)preg_match('#^/r/\d+$#', $here));
+        $active = $here === $href || ($href === '/' && (bool)preg_match('#^/[ro]/\d+$#', $here));
         return $active ? ' class="on" aria-current="page"' : '';
     };
 
@@ -24,6 +24,7 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
       <nav aria-label="Staff">
         <a href="/"' . $on('/') . '>Requests</a>
         <a href="/new"' . $on('/new') . '>New request</a>
+        <a href="/new-share"' . $on('/new-share') . '>Send message</a>
         <a href="/audit"' . $on('/audit') . '>Audit</a>
         <a href="/settings"' . $settingsOn . '>Settings</a>
       </nav>
@@ -442,6 +443,14 @@ function audit_label(string $action): string {
         'credential.reread'         => 'Credential opened again',
         'credential.read.lost_race' => 'Someone else opened it first',
         'credential.read.failed'    => 'Could not decrypt',
+        'share.created'             => 'Secure message sent',
+        'share.viewed'              => 'Customer opened the message',
+        'share.view.lost_race'      => 'Message was already opened',
+        'share.view.failed'         => 'Message could not be decrypted',
+        'share.unlock.failed'       => 'Wrong passphrase',
+        'share.destroyed.attempts'  => 'Destroyed after wrong passphrases',
+        'share.file.downloaded'     => 'Attachment downloaded',
+        'share.file.purged'         => 'Attachment purged',
         'request.created'           => 'Request created',
         'request.deleted'           => 'Request deleted',
         'request.expired'           => 'Request expired',
@@ -480,6 +489,12 @@ function audit_detail_label(string $action, ?string $detail): string {
         ];
         return $was[$m[1]] ?? ('Was ' . $m[1]);
     }
+    if ($action === 'share.created' && preg_match('/^view=(\S+) ttl=(\d+)s pass=(\S+) file=(\S+)$/', $detail, $m)) {
+        return view_label($m[1])
+            . ' · link lasts ' . (ttl_choices()[(int)$m[2]] ?? ($m[2] . ' seconds'))
+            . ' · ' . ($m[3] === 'yes' ? 'passphrase set' : 'no passphrase')
+            . ' · ' . ($m[4] === 'yes' ? 'with attachment' : 'no attachment');
+    }
     if ($action === 'request.created' && preg_match('/^need=(\S+) ttl=(\d+)s bug=(.*)$/s', $detail, $m)) {
         $need = needs()[$m[1]] ?? $m[1];
         $ttl  = ttl_choices()[(int)$m[2]] ?? ($m[2] . ' seconds');
@@ -507,13 +522,26 @@ function audit_detail_label(string $action, ?string $detail): string {
     return $detail;
 }
 
-function status_pill(string $status): string {
-    $map = [
-        'pending'   => ['awaiting customer', 'pending'],
-        'submitted' => ['ready to read', 'ready'],
-        'read'      => ['read &amp; destroyed', 'done'],
-        'expired'   => ['expired &amp; purged', 'dead'],
-    ];
+/**
+ * The same four statuses mean opposite things in each direction: 'pending' on an
+ * inbound request is us waiting on the customer, on an outbound share it is the
+ * customer not having opened it yet. One vocabulary for both read as nonsense on
+ * half the dashboard.
+ */
+function status_pill(string $status, bool $outbound = false): string {
+    $map = $outbound
+        ? [
+            'pending'   => ['not opened yet', 'pending'],
+            'submitted' => ['not opened yet', 'pending'],
+            'read'      => ['opened by customer', 'done'],
+            'expired'   => ['expired &amp; purged', 'dead'],
+        ]
+        : [
+            'pending'   => ['awaiting customer', 'pending'],
+            'submitted' => ['ready to read', 'ready'],
+            'read'      => ['read &amp; destroyed', 'done'],
+            'expired'   => ['expired &amp; purged', 'dead'],
+        ];
     [$label, $cls] = $map[$status] ?? [h($status), 'dead'];
     return '<span class="pill ' . $cls . '">' . $label . '</span>';
 }
@@ -619,6 +647,7 @@ function need_short(string $need): string {
         'wp_admin'        => 'WP admin',
         'wp_app_password' => 'App password',
         'ssh'             => 'SSH / SFTP',
+        'message'         => 'Secure message',
         default           => $need,
     };
 }

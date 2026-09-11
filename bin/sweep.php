@@ -8,5 +8,9 @@ env_load(getenv('APP_ENV_FILE') ?: '/home/instapod/handoff.env');
 require __DIR__ . '/../src/crypto.php';
 require __DIR__ . '/../src/freescout.php';
 require __DIR__ . '/../src/rotation.php';
+require __DIR__ . '/../src/shares.php';
 
 echo 'purged ' . purge_expired('cron') . "\n";
+// Attachment bytes survive the message by the length of the download grant, so a
+// quiet period leaves them on disk unless cron drops them too.
+echo 'attachments purged ' . purge_share_blobs('cron') . "\n";

@@ -45,11 +45,20 @@ function require_api_staff(): string {
     return (string)$row['email'];
 }
 
-function api_fetch_request(int $id): array {
+/**
+ * @param 'in'|'out'|null $direction Refuse a row of the other kind, so /requests/{id}
+ *        can never reveal (or try to reveal) an outbound share and vice versa.
+ */
+function api_fetch_request(int $id, ?string $direction = 'in'): array {
     $st = db()->prepare("SELECT * FROM requests WHERE id = ?");
     $st->execute([$id]);
     $r = $st->fetch();
     if (!$r) api_error(404, 'not_found', 'No such request.');
+    if ($direction !== null && (string)($r['direction'] ?? 'in') !== $direction) {
+        api_error(404, 'not_found', $direction === 'in'
+            ? 'No such request. That id is an outbound share — use /api/v1/shares.'
+            : 'No such share. That id is an inbound request — use /api/v1/requests.');
+    }
     return $r;
 }
 
@@ -87,14 +96,21 @@ function api_dispatch(string $path, string $method, string $base): void {
         foreach (needs() as $k => $label) $needs[] = ['id' => $k, 'label' => $label];
         $ttls = [];
         foreach (ttl_choices() as $sec => $label) $ttls[] = ['seconds' => $sec, 'label' => $label];
-        api_send(200, ['ok' => true, 'data' => ['needs' => $needs, 'ttl' => $ttls]]);
+        $views = [];
+        foreach (view_choices() as $k => $label) $views[] = ['id' => $k, 'label' => $label];
+        api_send(200, ['ok' => true, 'data' => [
+            'needs'          => $needs,
+            'ttl'            => $ttls,
+            'share_views'    => $views,
+            'max_attachment' => max_upload_bytes(),
+        ]]);
     }
 
     if ($path === '/api/v1/requests' && $method === 'GET') {
         $statusFilter = (string)($_GET['status'] ?? '');
         $ticketFilter = trim((string)($_GET['ticket_id'] ?? ''));
         $allowed = ['pending', 'submitted', 'read', 'expired'];
-        $sql = "SELECT * FROM requests WHERE 1=1";
+        $sql = "SELECT * FROM requests WHERE direction = 'in'";
         $params = [];
         if (in_array($statusFilter, $allowed, true)) {
             $sql .= " AND status = ?";
@@ -145,6 +161,58 @@ function api_dispatch(string $path, string $method, string $base): void {
         $payload['rotation_owed'] = $fresh['rotation_flagged_at'] !== null;
         sodium_memzero($out['plain']);
         api_send(200, ['ok' => true, 'data' => $payload]);
+    }
+
+    if ($path === '/api/v1/shares' && $method === 'GET') {
+        $statusFilter = (string)($_GET['status'] ?? '');
+        $ticketFilter = trim((string)($_GET['ticket_id'] ?? ''));
+        $sql = "SELECT * FROM requests WHERE direction = 'out'";
+        $params = [];
+        if (in_array($statusFilter, ['pending', 'read', 'expired'], true)) {
+            $sql .= " AND status = ?";
+            $params[] = $statusFilter;
+        }
+        if ($ticketFilter !== '') {
+            $sql .= " AND ticket_id = ?";
+            $params[] = $ticketFilter;
+        }
+        $sql .= requests_list_order_sql();
+        $st = db()->prepare($sql);
+        $st->execute($params);
+        $rows = [];
+        foreach ($st->fetchAll() as $r) $rows[] = share_to_api($r, $base);
+        api_send(200, ['ok' => true, 'data' => $rows]);
+    }
+
+    if ($path === '/api/v1/shares' && $method === 'POST') {
+        $body    = api_json_body();
+        $ticket  = trim((string)($body['ticket_id'] ?? ''));
+        $message = trim((string)($body['message'] ?? ''));
+        $view    = (string)($body['view'] ?? 'once');
+        $ttl     = (int)($body['ttl'] ?? 86400);
+        $pass    = (string)($body['passphrase'] ?? '');
+
+        $file = share_file_from_api($body['attachment'] ?? null);
+        if (is_string($file)) api_error(400, 'validation', $file);
+
+        if (!share_fields_valid($ticket, $message, $view, $ttl, $file !== null)) {
+            api_error(400, 'validation', 'ticket_id, a listed ttl and a listed view are required, plus a message or an attachment.');
+        }
+        if ($pass !== '' && strlen($pass) < 6) {
+            api_error(400, 'validation', 'passphrase must be at least 6 characters, or omitted.');
+        }
+        $minted = mint_share($staff, $ticket, $message, $view, $ttl, $pass === '' ? null : $pass, $file, $base);
+        api_send(201, ['ok' => true, 'data' => share_to_api(api_fetch_request($minted['id'], 'out'), $base)]);
+    }
+
+    if (preg_match('#^/api/v1/shares/(\d+)$#', $path, $m) && $method === 'GET') {
+        api_send(200, ['ok' => true, 'data' => share_to_api(api_fetch_request((int)$m[1], 'out'), $base)]);
+    }
+
+    if (preg_match('#^/api/v1/shares/(\d+)$#', $path, $m) && $method === 'DELETE') {
+        $r = api_fetch_request((int)$m[1], 'out');
+        expire_request((int)$r['id'], $staff);
+        api_send(200, ['ok' => true, 'data' => share_to_api(api_fetch_request((int)$r['id'], 'out'), $base)]);
     }
 
     if ($path === '/api/v1/audit' && $method === 'GET') {

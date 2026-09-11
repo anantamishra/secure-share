@@ -13,6 +13,10 @@ function flag_rotation(int $id): void {
     $st->execute([$id]);
     $r = $st->fetch();
     if (!$r || $r['rotation_flagged_at'] !== null) return;
+    // Outbound shares carry OUR secret to the customer, not theirs to us. There is
+    // nothing on their side to rotate, and telling them to change a password they
+    // never sent us reads as a breach notice for something that did not happen.
+    if (is_outbound($r)) return;
 
     $what = $r['need'] === 'ssh'
         ? [
@@ -70,8 +74,10 @@ function purge_expired(string $actor = 'system'): int {
     $st->execute([time()]);
     $n = 0;
     foreach ($st->fetchAll() as $r) {
-        $pdo->prepare("UPDATE requests SET status='expired', purged_at=?, nonce=NULL, ciphertext=NULL WHERE id=?")
+        $pdo->prepare("UPDATE requests SET status='expired', purged_at=?, nonce=NULL, ciphertext=NULL,
+                       dl_token=NULL, dl_expires=NULL WHERE id=?")
             ->execute([time(), $r['id']]);
+        blob_delete((string)$r['token']);
         audit($actor, 'request.expired.purged', (int)$r['id'], $r['ticket_id']);
         // Only nag when the customer actually sent something. An expired PENDING
         // link must not tell them to rotate a password they never submitted.

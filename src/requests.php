@@ -138,6 +138,8 @@ function delete_request(int $id, string $staff): bool {
 
     db()->prepare("UPDATE requests SET nonce=NULL, ciphertext=NULL, purged_at=? WHERE id=?")
         ->execute([time(), $id]);
+    // An outbound share's attachment lives on disk, so NULLing the row is not enough.
+    blob_delete((string)$r['token']);
     if ($r['submitted_at'] !== null && $r['rotation_flagged_at'] === null) {
         flag_rotation($id);
     }
@@ -154,9 +156,11 @@ function expire_request(int $id, string $staff): bool {
     $r = $st->fetch();
     if (!$r || $r['status'] === 'expired') return false;
 
-    $upd = db()->prepare("UPDATE requests SET status='expired', purged_at=?, nonce=NULL, ciphertext=NULL WHERE id=? AND status!='expired'");
+    $upd = db()->prepare("UPDATE requests SET status='expired', purged_at=?, nonce=NULL, ciphertext=NULL,
+                          dl_token=NULL, dl_expires=NULL WHERE id=? AND status!='expired'");
     $upd->execute([time(), $id]);
     if ($upd->rowCount() !== 1) return false;
+    blob_delete((string)$r['token']);
     audit($staff, 'request.expired', $id, (string)$r['ticket_id'], 'status=' . $r['status']);
     if ($r['submitted_at'] !== null) flag_rotation($id);
     return true;
