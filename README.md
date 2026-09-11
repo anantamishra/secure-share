@@ -45,7 +45,8 @@ same key, same burn-on-read; `direction` is the only thing that separates them.
     freescout-module/  drop-in FreeScout module (in-ticket mint button)
     bin/staff.php      add/disable/list/token/revoke-token staff
     bin/sweep.php      cron: purge expired, fire rotation nags
-    bin/e2e.sh         132 end-to-end assertions
+    bin/e2e.sh         136 end-to-end assertions
+    CHANGELOG.md       what changed, per version
 
 ## Config — `/home/instapod/handoff.env` (chmod 600, OUTSIDE the checkout)
 
@@ -81,6 +82,27 @@ copied anywhere else.
 - `display_errors` must be **Off**. A startup warning is printed before the front controller
   runs, which sends headers and turns a clean error response into a 200 with PHP's warning in
   the body.
+
+## Versioning
+
+`APP_VERSION` in `src/bootstrap.php` is the only place the version is written down.
+Semver against the HTTP surface staff and the API depend on: a new endpoint or capability
+is a minor, a change that breaks an existing caller is a major. **Bump it in the same commit
+as the change it describes** — a version bumped afterwards in a release commit of its own
+tells you a release happened but not which code it covers. `CHANGELOG.md` carries the detail.
+
+Where to read it back:
+
+    staff footer            every signed-in page
+    GET /api/v1/me          "version": "1.1.0"
+
+Deliberately **not** on `/healthz` or `/api/v1/health`. Both are unauthenticated, and
+naming the exact build to anyone who can reach the host tells them which advisories to
+try. Ops already has a token (`php bin/staff.php token …`); checking a deploy is one
+authenticated call.
+
+`freescout-module/SecureHandoff/module.json` versions independently — it is installed
+into someone else's FreeScout on their schedule, not deployed with this app.
 
 ## Operating
 
@@ -185,7 +207,7 @@ upload inside FreeScout's request cycle — a separate piece of work, not done h
 
     bash bin/e2e.sh 8799
 
-132 assertions covering auth, CSRF, the Tier-1 gate, the field allowlist, single-use links,
+136 assertions covering auth, CSRF, the Tier-1 gate, the field allowlist, single-use links,
 burn-on-read, expiry purge, the rotation nag, audit rows, and that a wrong `APP_KEY` fails loudly
 rather than silently.
 

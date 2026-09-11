@@ -377,6 +377,13 @@ ok "api share delete expires it"   "$(code -X DELETE -H "Authorization: Bearer $
 ok "deleted share is dead"         "$(sqlite3 "$DB2" "SELECT status FROM requests WHERE id=$SID")" "expired"
 
 
+# --- VERSION: one source of truth, and not handed to anonymous callers ---
+VSRC=$(php -r 'require "'"$ROOT"'/src/bootstrap.php"; echo APP_VERSION;')
+ok "version is semver"             "$(printf '%s' "$VSRC" | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+$')" "1"
+ok "api me reports the version"    "$(curl -s -m 20 -H "Authorization: Bearer $TOKA" $B2/api/v1/me | grep -c "\"version\":\"$VSRC\"")" "1"
+ok "healthz hides the version"     "$(curl -s -m 20 $B2/healthz | grep -c "$VSRC")" "0"
+ok "changelog documents it"        "$(grep -c "^## $VSRC\$" "$ROOT/CHANGELOG.md")" "1"
+
 sedi "s/^APP_KEY=.*/APP_KEY=$(php -r 'echo bin2hex(random_bytes(32));')/" "$TMP/env"
 ok "wrong key -> loud failure"  "$(php -r 'require "'"$ROOT"'/src/bootstrap.php"; env_load(getenv("APP_ENV_FILE")); require "'"$ROOT"'/src/crypto.php"; try { unseal(base64_encode(random_bytes(24)), base64_encode(random_bytes(60))); echo "silent"; } catch (Throwable $e) { echo "threw"; }')" "threw"
 

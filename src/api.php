@@ -88,6 +88,7 @@ function api_dispatch(string $path, string $method, string $base): void {
             'email'          => $staff,
             'name'           => trim((string)($acct['name'] ?? '')),
             'infra_enabled'  => infra_enabled(),
+            'version'        => APP_VERSION,
         ]]);
     }
 

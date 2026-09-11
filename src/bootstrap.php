@@ -10,6 +10,19 @@ declare(strict_types=1);
  */
 
 /**
+ * The application version, and the only place it is written down.
+ *
+ * Semver against the HTTP surface staff and the API depend on: a new endpoint or a
+ * new capability is a minor, a change that breaks an existing caller is a major.
+ * Bump it in the same commit as the change it describes — a version bumped later,
+ * on its own, tells you a release happened but not which code it covers.
+ *
+ * `freescout-module/SecureHandoff/module.json` carries its own version and moves
+ * independently: it is installed into somebody else's FreeScout on its own schedule.
+ */
+const APP_VERSION = '1.1.0';
+
+/**
  * What the form is allowed to collect.
  *
  * WordPress options are always available: a temporary admin account and an

@@ -64,7 +64,7 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
     $foot = match ($audience) {
         'customer' => '<footer class="foot">Encrypted in transit and at rest · You choose how long we keep them</footer>',
         'guest'    => '<footer class="foot">Staff only · Customer links do not use this page</footer>',
-        default    => '',
+        default    => '<footer class="foot">Internal tool · v' . APP_VERSION . '</footer>',
     };
 
     return '<!doctype html><html lang="en"><head><meta charset="utf-8">
