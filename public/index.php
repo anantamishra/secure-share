@@ -463,12 +463,22 @@ if ($path === '/') {
         redirect('/?status=' . $back . $backDir);
     }
 
-    $allowed = ['pending' => 'Awaiting', 'submitted' => 'Ready', 'read' => 'Read', 'expired' => 'Expired'];
+    $allowed    = ['pending' => 'Awaiting', 'submitted' => 'Ready', 'read' => 'Read', 'expired' => 'Expired'];
+    $dirAllowed = ['in' => 'From customer', 'out' => 'Sent to customer'];
+
+    $dirFilter = (string)($_GET['dir'] ?? '');
+    $dirFilter = isset($dirAllowed[$dirFilter]) ? $dirFilter : '';
+
+    // Each filter's counts are scoped by the OTHER one. Counted globally they
+    // describe a list you cannot reach: "Awaiting (4)" sitting next to an active
+    // direction that holds one row sends you to an empty table and looks broken.
     $counts = ['pending' => 0, 'submitted' => 0, 'read' => 0, 'expired' => 0];
-    foreach (db()->query("SELECT status, COUNT(*) c FROM requests GROUP BY status")->fetchAll() as $c) {
-        $counts[$c['status']] = (int)$c['c'];
-    }
+    $cs = db()->prepare("SELECT status, COUNT(*) c FROM requests"
+        . ($dirFilter === '' ? '' : " WHERE direction = ?") . " GROUP BY status");
+    $cs->execute($dirFilter === '' ? [] : [$dirFilter]);
+    foreach ($cs->fetchAll() as $c) $counts[$c['status']] = (int)$c['c'];
     $total = array_sum($counts);
+
     $fallback = $counts['read'] > 0 ? 'read' : '';
     if (!isset($_GET['status'])) {
         $statusFilter = $fallback;
@@ -477,14 +487,19 @@ if ($path === '/') {
         $statusFilter = $raw === 'all' ? '' : (isset($allowed[$raw]) ? $raw : $fallback);
     }
 
-    $dirWhere = (string)($_GET['dir'] ?? '');
-    $dirWhere = in_array($dirWhere, ['in', 'out'], true) ? $dirWhere : '';
+    $dirCounts = ['in' => 0, 'out' => 0];
+    $dc = db()->prepare("SELECT direction, COUNT(*) c FROM requests"
+        . ($statusFilter === '' ? '' : " WHERE status = ?") . " GROUP BY direction");
+    $dc->execute($statusFilter === '' ? [] : [$statusFilter]);
+    foreach ($dc->fetchAll() as $c) {
+        $dirCounts[(string)$c['direction'] === 'out' ? 'out' : 'in'] += (int)$c['c'];
+    }
 
     $sql = "SELECT * FROM requests";
     $params = [];
-    $where = [];
+    $where  = [];
     if (isset($allowed[$statusFilter])) { $where[] = "status = ?";    $params[] = $statusFilter; }
-    if ($dirWhere !== '')               { $where[] = "direction = ?"; $params[] = $dirWhere; }
+    if ($dirFilter !== '')              { $where[] = "direction = ?"; $params[] = $dirFilter; }
     if ($where) $sql .= ' WHERE ' . implode(' AND ', $where);
     $sql .= requests_list_order_sql();
     $st = db()->prepare($sql);
@@ -496,35 +511,32 @@ if ($path === '/') {
         ? '<div class="box warn"><strong>' . $ready . ' request' . ($ready === 1 ? '' : 's') . ' ready to read.</strong> Open ' . ($ready === 1 ? 'it' : 'one') . ' only when you are ready to use the credential — reading destroys the stored copy.</div>'
         : '';
 
-    $filters = '<div class="filters" role="navigation" aria-label="Filter by status">';
-    $allOn = $statusFilter === '' ? ' class="on"' : '';
-    $filters .= '<a href="/?status=all"' . $allOn . '>All (' . $total . ')</a>';
+    // Every link carries BOTH parameters. Dropping one meant picking a status
+    // silently cleared the direction you were looking at.
+    $fLink = fn(string $st, string $dir) => '/?status=' . ($st === '' ? 'all' : $st)
+                                          . ($dir === '' ? '' : '&dir=' . $dir);
+
+    $filters = '<div class="filters" role="navigation" aria-label="Filter requests">'
+             . '<a href="' . $fLink('', $dirFilter) . '"' . ($statusFilter === '' ? ' class="on"' : '')
+             . '>All (' . $total . ')</a>';
     foreach ($allowed as $k => $label) {
-        $on = $statusFilter === $k ? ' class="on"' : '';
-        $filters .= '<a href="/?status=' . $k . '"' . $on . '>' . $label . ' (' . $counts[$k] . ')</a>';
+        // A chip whose only destination is an empty table is furniture, not a filter.
+        if ($counts[$k] === 0 && $statusFilter !== $k) continue;
+        $filters .= '<a href="' . $fLink($k, $dirFilter) . '"' . ($statusFilter === $k ? ' class="on"' : '')
+                 . '>' . $label . ' (' . $counts[$k] . ')</a>';
+    }
+    // One segmented control rather than a second row of pills. The arrows are the
+    // same ones the table uses, so the vocabulary is learned once.
+    if ($dirCounts['out'] > 0 || $dirFilter !== '') {
+        $filters .= '<span class="seg" role="group" aria-label="Direction">'
+                 . '<a href="' . $fLink($statusFilter, '') . '"' . ($dirFilter === '' ? ' class="on"' : '') . '>Both</a>'
+                 . '<a href="' . $fLink($statusFilter, 'in') . '"' . ($dirFilter === 'in' ? ' class="on"' : '')
+                 . ' title="Credentials the customer sends us">&larr; In (' . $dirCounts['in'] . ')</a>'
+                 . '<a href="' . $fLink($statusFilter, 'out') . '"' . ($dirFilter === 'out' ? ' class="on"' : '')
+                 . ' title="Secure messages we send the customer">&rarr; Out (' . $dirCounts['out'] . ')</a>'
+                 . '</span>';
     }
     $filters .= '</div>';
-
-    // The two directions share a table, and 'Awaiting' meaning two different things
-    // depending on the row is the kind of thing that gets a credential read late.
-    $dirAllowed = ['in' => 'From customer', 'out' => 'Sent to customer'];
-    $dirRaw = (string)($_GET['dir'] ?? '');
-    $dirFilter = isset($dirAllowed[$dirRaw]) ? $dirRaw : '';
-    $dirCounts = ['in' => 0, 'out' => 0];
-    foreach (db()->query("SELECT direction, COUNT(*) c FROM requests GROUP BY direction")->fetchAll() as $c) {
-        $key = (string)$c['direction'] === 'out' ? 'out' : 'in';
-        $dirCounts[$key] += (int)$c['c'];
-    }
-    if ($dirCounts['out'] > 0) {
-        $qs = fn(string $d) => '/?status=' . ($statusFilter === '' ? 'all' : $statusFilter) . ($d === '' ? '' : '&dir=' . $d);
-        $filters .= '<div class="filters" role="navigation" aria-label="Filter by direction">'
-                 . '<a href="' . $qs('') . '"' . ($dirFilter === '' ? ' class="on"' : '') . '>Both</a>';
-        foreach ($dirAllowed as $k => $label) {
-            $filters .= '<a href="' . $qs($k) . '"' . ($dirFilter === $k ? ' class="on"' : '') . '>'
-                      . $label . ' (' . $dirCounts[$k] . ')</a>';
-        }
-        $filters .= '</div>';
-    }
 
     $statusQs = $statusFilter === '' ? 'all' : $statusFilter;
     $body = '<div class="pagehead"><h2>Requests</h2>'

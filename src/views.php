@@ -316,6 +316,15 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
         border:1px solid var(--line);background:var(--panel)}
   .filters a:hover{background:var(--mint-soft);color:var(--brand);border-color:transparent}
   .filters a.on{background:var(--btn);color:var(--btn-fg);border-color:var(--btn)}
+  /* Direction lives in the same row as status: a second row of pills was more
+     chrome than the table it was filtering. margin-left:auto parks it on the right;
+     it wraps underneath on narrow screens rather than squeezing the status chips. */
+  .filters .seg{display:inline-flex;margin-left:auto;border:1px solid var(--line);
+        border-radius:99px;background:var(--panel);overflow:hidden}
+  .filters .seg a{border:0;border-radius:0;background:transparent;padding:6px 11px}
+  .filters .seg a + a{border-left:1px solid var(--line)}
+  .filters .seg a:hover{background:var(--mint-soft);color:var(--brand)}
+  .filters .seg a.on{background:var(--btn);color:var(--btn-fg)}
   .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:16px 0 0}
   .pager .btn-row{margin:0}
   .pager .off{opacity:.4;pointer-events:none}
@@ -338,6 +347,7 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
     .who{display:none}
   }
   @media (max-width:640px){
+    .filters .seg{margin-left:0}
     .meta{grid-template-columns:1fr}
     .meta dt{border-bottom:0;padding-bottom:0}
     nav{width:100%}
