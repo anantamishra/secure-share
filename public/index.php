@@ -162,8 +162,12 @@ if (preg_match('#^/s/([a-f0-9]{48})$#', $path, $m)) {
                     . '<p class="hint">Paste a password or a private key. Prefer a separate account created for this ticket.</p></div>';
             continue;
         }
+        $input = '<input id="' . $id . '" name="' . h($k) . '" type="' . $type . '" autocomplete="' . $auto . '" spellcheck="false" autocapitalize="off"' . $ph . $keep . $req . '>';
+        if ($k === 'password') {
+            $input = '<div class="password-control">' . $input . password_toggle_button() . '</div>';
+        }
         $inputs .= '<div class="field"><label for="' . $id . '">' . h($lbl) . ($req ? '' : ' (optional)') . '</label>'
-                . '<input id="' . $id . '" name="' . h($k) . '" type="' . $type . '" autocomplete="' . $auto . '" spellcheck="false" autocapitalize="off"' . $ph . $keep . $req . '></div>';
+                . $input . '</div>';
     }
 
     $sharePicked = share_from_post();
@@ -329,7 +333,7 @@ if ($path === '/') {
                   . icon_expire_svg() . '<span class="ico-name">Expire</span></button>'
                 : '<button class="ico-btn expire" type="button" disabled aria-label="Already expired">'
                   . icon_expire_svg() . '<span class="ico-name">Already expired</span></button>';
-            $body .= '<tr' . $rowCls . '>'
+            $body .= '<tr' . $rowCls . ' data-href="/r/' . $id . '">'
                   . '<td><a class="rowlink" href="/r/' . $id . '">#' . h($r['ticket_id']) . '</a></td>'
                   . '<td class="need-short" title="' . h($needFull) . '">' . h(need_short((string)$r['need'])) . '</td>'
                   . '<td>' . status_pill($r['status']) . '</td>'
@@ -455,6 +459,7 @@ if (preg_match('#^/r/(\d+)$#', $path, $m)) {
     if (!$r) { http_response_code(404); echo layout('Not found', '<div class="box danger">No such request.</div>', $staff); exit; }
 
     $reveal = '';
+    $revealed = false;
     if ($method === 'POST' && ($_POST['action'] ?? '') === 'reveal') {
         csrf_check();
         $out = reveal_request($r, $staff);
@@ -468,11 +473,13 @@ if (preg_match('#^/r/(\d+)$#', $path, $m)) {
                 $reveal = '<div class="box danger">' . h($out['error']) . '</div>';
             }
         } elseif (share_is_once($r)) {
+            $revealed = true;
             $reveal = '<div class="box warn"><strong>Read once — now destroyed.</strong>
                       <p>This will not be shown again. Copy what you need now, and do not paste it into the ticket.</p>'
                       . render_credential($out['plain']) . '</div>';
             sodium_memzero($out['plain']);
         } else {
+            $revealed = true;
             $reveal = '<div class="box warn"><strong>Still available until ' . local_time((int)$r['expires_at']) . '.</strong>
                       <p>Copy what you need now, and do not paste it into the ticket. You can open this again until it expires.</p>'
                       . render_credential($out['plain']) . '</div>';
@@ -484,6 +491,11 @@ if (preg_match('#^/r/(\d+)$#', $path, $m)) {
 
     $link   = $base . '/s/' . $r['token'];
     $until  = local_time((int)$r['expires_at']);
+
+    // Suppressed below when the credential is already on the page. A multi-day share stays
+    // 'submitted' after a read -- only read_at/read_by are set -- so without this the "Ready
+    // to read" prompt renders again directly under the secret it just handed over, inviting a
+    // second pointless open. The reveal box already says how long it stays available.
     $action = match ($r['status']) {
         'pending'   => '<div class="box"><strong>Waiting on the customer.</strong>
                         <p class="hint" style="margin-bottom:10px">Copy the link, then send it to the customer.</p>
@@ -520,7 +532,7 @@ if (preg_match('#^/r/(\d+)$#', $path, $m)) {
 
     echo layout('Request #' . $r['id'],
         '<div class="pagehead"><h2>Ticket #' . h($r['ticket_id']) . '</h2>' . status_pill($r['status']) . '</div>
-         ' . $reveal . $action . $rot . '
+         ' . $reveal . ($revealed ? '' : $action) . $rot . '
          <div class="section">
          <h2>Why this was raised</h2>
          <dl class="meta">
