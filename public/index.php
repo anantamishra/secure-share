@@ -9,6 +9,7 @@ require __DIR__ . '/../src/views.php';
 require __DIR__ . '/../src/freescout.php';
 require __DIR__ . '/../src/rotation.php';
 require __DIR__ . '/../src/requests.php';
+require __DIR__ . '/../src/shares.php';
 require __DIR__ . '/../src/api.php';
 
 // Without this an uncaught throwable renders a blank page (or, if the pod ever has
@@ -33,6 +34,25 @@ set_exception_handler(function (Throwable $e): void {
 header('X-Frame-Options: DENY');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: no-referrer');
+/**
+ * No-store on EVERY response, not just the ones that happen to touch a session.
+ *
+ * Staff pages were getting these headers by accident: current_staff() starts a
+ * session, and PHP's session_cache_limiter emits no-store on its way out. The
+ * customer routes never start a session, so /s/ and /v/ shipped with no cache
+ * headers at all -- including the /v/ response that renders the decrypted message.
+ *
+ * That made the destruction we promise partly untrue. A view-once share was gone
+ * from our database but still in the customer's on-disk browser cache, re-renderable
+ * with the back button after the page said it had been destroyed, and retainable by
+ * any TLS-terminating proxy on their side. public/ serves nothing but this front
+ * controller -- no static assets -- so there is nothing here that wants caching.
+ * Routes that set their own Cache-Control (the API, the attachment download) still
+ * override this, because header() replaces by default.
+ */
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+header('Expires: 0');
 header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-" . csp_nonce() . "'; form-action 'self'; frame-ancestors 'none'");
 
 $path   = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
@@ -42,12 +62,34 @@ $base   = rtrim(cfg('APP_URL', 'https://' . ($_SERVER['HTTP_HOST'] ?? 'localhost
 /** Expire and purge anything past its deadline. Cheap, so run it on every request. */
 function sweep(): void {
     purge_expired('system');
+    // Attachment bytes outlive the message they came with, by exactly the length of
+    // the download grant. This is what closes that window.
+    purge_share_blobs('system');
 }
 
 if ($path === '/healthz') {
     header('Content-Type: application/json');
     try { db(); master_key(); echo json_encode(['ok' => true]); }
     catch (Throwable $e) { http_response_code(500); echo json_encode(['ok' => false, 'error' => $e->getMessage()]); }
+    exit;
+}
+
+// Before anything reads $_POST: see post_exceeded_limit().
+if (post_exceeded_limit()) {
+    $limit = share_size_label(ini_bytes('post_max_size'));
+    if (!headers_sent()) {
+        http_response_code(413);
+        header('Content-Type: ' . (str_starts_with($path, '/api/') ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8'));
+    }
+    if (str_starts_with($path, '/api/')) {
+        echo json_encode(['ok' => false, 'error' => [
+            'code'    => 'too_large',
+            'message' => 'Request body exceeds the server limit of ' . $limit . '.',
+        ]]);
+    } else {
+        echo "That upload is larger than this server accepts (limit $limit).\n"
+           . "Send the file a different way, or ask an admin to raise post_max_size.\n";
+    }
     exit;
 }
 
@@ -70,6 +112,9 @@ if (preg_match('#^/s/([a-f0-9]{48})$#', $path, $m)) {
         null, ['audience' => 'customer']));
 
     if (!$r)                        { http_response_code(404); $gone('The link is not valid.'); exit; }
+    // Tokens are unique across both directions, so an outbound token would otherwise
+    // match here and render a credential form for a message we are trying to deliver.
+    if (is_outbound($r))            { redirect('/v/' . $r['token']); }
     if ($r['status'] !== 'pending') { http_response_code(410); $gone('It has already been used.'); exit; }
     if ($r['expires_at'] < time())  { http_response_code(410); $gone('It has expired.'); exit; }
 
@@ -202,6 +247,174 @@ if (preg_match('#^/s/([a-f0-9]{48})$#', $path, $m)) {
     exit;
 }
 
+// ------------------------------------------------- customer side: outbound share
+
+/** Stream a share attachment against a live download grant. */
+if (preg_match('#^/v/([a-f0-9]{48})/f/([a-f0-9]{48})$#', $path, $m)) {
+    $st = db()->prepare("SELECT * FROM requests WHERE token = ? AND direction = 'out'");
+    $st->execute([$m[1]]);
+    $r = $st->fetch();
+    if (!$r || !share_grant_ok($r, $m[2]) || (int)$r['expires_at'] < time()) {
+        http_response_code(410);
+        echo layout('Download unavailable',
+            '<div class="box danger"><strong>This download link has expired.</strong>
+             <p>An attachment stays available for a short time after the message is opened, then it is destroyed.</p></div>
+             <p class="mut">Reply on your support ticket and we will send a fresh link.</p>',
+            null, ['audience' => 'customer']);
+        exit;
+    }
+    $blob = blob_get((string)$r['token']);
+    if ($blob === null) { http_response_code(410); exit('This attachment has been destroyed.'); }
+    try {
+        $bytes = unseal_raw($blob);
+    } catch (Throwable $e) {
+        audit('customer', 'share.view.failed', (int)$r['id'], (string)$r['ticket_id'], $e->getMessage());
+        http_response_code(500);
+        exit('This attachment could not be decrypted.');
+    }
+
+    audit('customer', 'share.file.downloaded', (int)$r['id'], (string)$r['ticket_id'], 'bytes=' . strlen($bytes));
+
+    $name  = (string)$r['file_name'];
+    $ascii = str_replace('"', '', (string)preg_replace('/[^\x20-\x7E]/', '_', $name));
+    // ALWAYS octet-stream, never the detected type: serving a customer-supplied SVG
+    // or HTML back as itself would run script on this origin, and this origin is the
+    // one holding everyone else's secrets. The stored mime is for display only.
+    header('Content-Type: application/octet-stream');
+    header('Content-Disposition: attachment; filename="' . $ascii . '"; filename*=UTF-8\'\'' . rawurlencode($name));
+    header('Content-Length: ' . strlen($bytes));
+    header('Cache-Control: no-store, max-age=0');
+    header('X-Content-Type-Options: nosniff');
+    echo $bytes;
+    exit;
+}
+
+if (preg_match('#^/v/([a-f0-9]{48})$#', $path, $m)) {
+    $st = db()->prepare("SELECT * FROM requests WHERE token = ?");
+    $st->execute([$m[1]]);
+    $r = $st->fetch();
+
+    $gone = fn(string $why) => print(layout('Message unavailable',
+        '<div class="box danger"><strong>This message is no longer available.</strong><p>' . h($why) . '</p></div>
+         <p class="mut">Reply on your support ticket and we will send you a new one.</p>',
+        null, ['audience' => 'customer']));
+
+    if (!$r)              { http_response_code(404); $gone('The link is not valid.'); exit; }
+    if (!is_outbound($r)) { redirect('/s/' . $r['token']); }
+    if ((int)$r['expires_at'] < time()) { http_response_code(410); $gone('It has expired.'); exit; }
+    if (!share_openable($r)) {
+        http_response_code(410);
+        $gone($r['status'] === 'expired'
+            ? 'It has expired, or it was destroyed after too many wrong passphrase attempts.'
+            : 'It has already been opened. A view-once message is destroyed as soon as it is read.');
+        exit;
+    }
+
+    $locked  = $r['pass_hash'] !== null;
+    $hasFile = $r['file_name'] !== null;
+    $err     = '';
+
+    if ($method === 'POST') {
+        // The link is the only credential here, so it is also the only thing worth
+        // rate-limiting on. Wrong passphrases are counted separately and destructively
+        // by share_pass_failed().
+        if (!throttle_ok('share-open:' . $r['token'], 20, 900)) {
+            http_response_code(429); exit('Too many attempts. Wait 15 minutes.');
+        }
+        $unlocked = true;
+        if ($locked) {
+            $given = (string)($_POST['pass'] ?? '');
+            if ($given === '' || !password_verify($given, (string)$r['pass_hash'])) {
+                $unlocked = false;
+                if (share_pass_failed($r)) {
+                    http_response_code(410);
+                    $gone('It was destroyed after ' . SHARE_MAX_PASS_FAILS . ' wrong passphrase attempts.');
+                    exit;
+                }
+                $st->execute([$m[1]]);
+                $r = $st->fetch();
+                $left = SHARE_MAX_PASS_FAILS - (int)$r['pass_fails'];
+                $err  = '<div class="box danger"><strong>That passphrase is not right.</strong>
+                         <p>' . $left . ' attempt' . ($left === 1 ? '' : 's') . ' left. After that the message is
+                         destroyed and we will have to send a new one.</p></div>';
+            }
+        }
+
+        if ($unlocked) {
+            $opened = open_share($r, $base);
+            if (!$opened['ok']) { http_response_code(410); $gone($opened['error']); exit; }
+
+            $body = '<div class="box ok"><strong>Here it is.</strong><p>'
+                  . (view_is_once($r)
+                      ? 'This message has now been destroyed on our side. Copy anything you need before you close the page.'
+                      : 'You can re-open this link until ' . local_time((int)$r['expires_at']) . '.')
+                  . '</p></div>';
+            if ($opened['message'] !== '') {
+                $body .= '<div class="cred"><div class="cred-row">'
+                      . '<div class="cred-k">Message</div>'
+                      . '<div class="linkrow">'
+                      . '<pre id="share-msg" class="verbatim cred-v">' . h($opened['message']) . '</pre>'
+                      . copy_button('share-msg')
+                      . '</div></div></div>';
+            }
+            if ($opened['file'] !== null) {
+                $body .= '<div class="box"><strong>Attachment</strong>
+                          <p class="mut">' . h($opened['file']['name']) . ' — ' . h(share_size_label($opened['file']['size'])) . '</p>
+                          <p class="btn-row"><a class="btn" href="' . h($opened['file']['url']) . '">Download</a></p>
+                          <p class="hint">This download stays available for '
+                          . (int)round(SHARE_DOWNLOAD_GRANT / 60) . ' minutes, then the file is destroyed too.</p></div>';
+            } elseif ($hasFile) {
+                $body .= '<div class="box warn"><strong>The attachment is no longer available.</strong>
+                          <p>The message reached you but the file had already been purged. Ask us to resend it.</p></div>';
+            }
+            $body .= '<p class="mut">Ticket #' . h((string)$r['ticket_id']) . '. If you did not expect this message, tell us on the ticket.</p>';
+            echo layout('Your secure message', $body, null, ['audience' => 'customer']);
+            exit;
+        }
+    }
+
+    // GET never opens the message.
+    //
+    // Mail gateways, link scanners and chat previewers fetch every URL in an email
+    // before a human sees it. If GET burned the message, a customer on a scanned
+    // mailbox would open the link to find it already destroyed -- by their own
+    // employer's security software -- and the secret would have been read by a
+    // machine we cannot ask about it. The click below is what separates a human
+    // from a prefetch.
+    $lede = view_is_once($r)
+        ? 'Someone at InstaWP support sent you this. <strong>It can be opened once.</strong> When you open it, our copy is destroyed.'
+        : 'Someone at InstaWP support sent you this. You can open it until ' . local_time((int)$r['expires_at']) . '.';
+
+    $form = '<form method="post" class="card">';
+    if ($locked) {
+        $form .= '<div class="field">
+                    <label for="f-pass">Passphrase</label>
+                    <div class="password-control">
+                      <input id="f-pass" name="pass" type="password" required autocomplete="off"
+                             spellcheck="false" autocapitalize="off" autofocus>'
+              . password_toggle_button() . '
+                    </div>
+                    <p class="hint">Support gave you this separately — on the phone, or by text. It is not in the email.</p>
+                  </div>';
+    }
+    $form .= '<p class="btn-row"><button class="btn-block" type="submit">'
+          . ($locked ? 'Unlock and open' : 'Open the message') . '</button></p></form>';
+
+    echo layout('A secure message for you',
+        $err . '
+        <h2>Ticket #' . h((string)$r['ticket_id']) . '</h2>
+        <p class="lede">' . $lede . '</p>
+        ' . ($hasFile ? '<p class="mut">It includes an attachment: ' . h((string)$r['file_name'])
+                      . ' (' . h(share_size_label((int)$r['file_size'])) . ').</p>' : '') . '
+        <p class="mut">This link expires ' . local_time((int)$r['expires_at']) . '</p>
+        ' . ($locked ? '' : '<div class="box warn"><strong>Open it when you are ready to use it.</strong>
+             <p>' . (view_is_once($r) ? 'Opening destroys our copy, so do not open it just to check it works.'
+                                      : 'You can come back to this link until it expires.') . '</p></div>') . '
+        ' . $form,
+        null, ['audience' => 'customer']);
+    exit;
+}
+
 // ------------------------------------------------------------------- staff side
 
 if ($path === '/login') {
@@ -264,15 +477,27 @@ if ($path === '/') {
         if ($back !== 'all' && !isset(['pending' => 1, 'submitted' => 1, 'read' => 1, 'expired' => 1][$back])) {
             $back = 'all';
         }
-        redirect('/?status=' . $back);
+        $backDir = (string)($_POST['dir'] ?? '');
+        $backDir = in_array($backDir, ['in', 'out'], true) ? '&dir=' . $backDir : '';
+        redirect('/?status=' . $back . $backDir);
     }
 
-    $allowed = ['pending' => 'Awaiting', 'submitted' => 'Ready', 'read' => 'Read', 'expired' => 'Expired'];
+    $allowed    = ['pending' => 'Awaiting', 'submitted' => 'Ready', 'read' => 'Read', 'expired' => 'Expired'];
+    $dirAllowed = ['in' => 'From customer', 'out' => 'Sent to customer'];
+
+    $dirFilter = (string)($_GET['dir'] ?? '');
+    $dirFilter = isset($dirAllowed[$dirFilter]) ? $dirFilter : '';
+
+    // Each filter's counts are scoped by the OTHER one. Counted globally they
+    // describe a list you cannot reach: "Awaiting (4)" sitting next to an active
+    // direction that holds one row sends you to an empty table and looks broken.
     $counts = ['pending' => 0, 'submitted' => 0, 'read' => 0, 'expired' => 0];
-    foreach (db()->query("SELECT status, COUNT(*) c FROM requests GROUP BY status")->fetchAll() as $c) {
-        $counts[$c['status']] = (int)$c['c'];
-    }
+    $cs = db()->prepare("SELECT status, COUNT(*) c FROM requests"
+        . ($dirFilter === '' ? '' : " WHERE direction = ?") . " GROUP BY status");
+    $cs->execute($dirFilter === '' ? [] : [$dirFilter]);
+    foreach ($cs->fetchAll() as $c) $counts[$c['status']] = (int)$c['c'];
     $total = array_sum($counts);
+
     $fallback = $counts['read'] > 0 ? 'read' : '';
     if (!isset($_GET['status'])) {
         $statusFilter = $fallback;
@@ -281,12 +506,20 @@ if ($path === '/') {
         $statusFilter = $raw === 'all' ? '' : (isset($allowed[$raw]) ? $raw : $fallback);
     }
 
+    $dirCounts = ['in' => 0, 'out' => 0];
+    $dc = db()->prepare("SELECT direction, COUNT(*) c FROM requests"
+        . ($statusFilter === '' ? '' : " WHERE status = ?") . " GROUP BY direction");
+    $dc->execute($statusFilter === '' ? [] : [$statusFilter]);
+    foreach ($dc->fetchAll() as $c) {
+        $dirCounts[(string)$c['direction'] === 'out' ? 'out' : 'in'] += (int)$c['c'];
+    }
+
     $sql = "SELECT * FROM requests";
     $params = [];
-    if (isset($allowed[$statusFilter])) {
-        $sql .= " WHERE status = ?";
-        $params[] = $statusFilter;
-    }
+    $where  = [];
+    if (isset($allowed[$statusFilter])) { $where[] = "status = ?";    $params[] = $statusFilter; }
+    if ($dirFilter !== '')              { $where[] = "direction = ?"; $params[] = $dirFilter; }
+    if ($where) $sql .= ' WHERE ' . implode(' AND ', $where);
     $sql .= requests_list_order_sql();
     $st = db()->prepare($sql);
     $st->execute($params);
@@ -297,17 +530,37 @@ if ($path === '/') {
         ? '<div class="box warn"><strong>' . $ready . ' request' . ($ready === 1 ? '' : 's') . ' ready to read.</strong> Open ' . ($ready === 1 ? 'it' : 'one') . ' only when you are ready to use the credential — reading destroys the stored copy.</div>'
         : '';
 
-    $filters = '<div class="filters" role="navigation" aria-label="Filter by status">';
-    $allOn = $statusFilter === '' ? ' class="on"' : '';
-    $filters .= '<a href="/?status=all"' . $allOn . '>All (' . $total . ')</a>';
+    // Every link carries BOTH parameters. Dropping one meant picking a status
+    // silently cleared the direction you were looking at.
+    $fLink = fn(string $st, string $dir) => '/?status=' . ($st === '' ? 'all' : $st)
+                                          . ($dir === '' ? '' : '&dir=' . $dir);
+
+    $filters = '<div class="filters" role="navigation" aria-label="Filter requests">'
+             . '<a href="' . $fLink('', $dirFilter) . '"' . ($statusFilter === '' ? ' class="on"' : '')
+             . '>All (' . $total . ')</a>';
     foreach ($allowed as $k => $label) {
-        $on = $statusFilter === $k ? ' class="on"' : '';
-        $filters .= '<a href="/?status=' . $k . '"' . $on . '>' . $label . ' (' . $counts[$k] . ')</a>';
+        // A chip whose only destination is an empty table is furniture, not a filter.
+        if ($counts[$k] === 0 && $statusFilter !== $k) continue;
+        $filters .= '<a href="' . $fLink($k, $dirFilter) . '"' . ($statusFilter === $k ? ' class="on"' : '')
+                 . '>' . $label . ' (' . $counts[$k] . ')</a>';
+    }
+    // One segmented control rather than a second row of pills. The arrows are the
+    // same ones the table uses, so the vocabulary is learned once.
+    if ($dirCounts['out'] > 0 || $dirFilter !== '') {
+        $filters .= '<span class="seg" role="group" aria-label="Direction">'
+                 . '<a href="' . $fLink($statusFilter, '') . '"' . ($dirFilter === '' ? ' class="on"' : '') . '>Both</a>'
+                 . '<a href="' . $fLink($statusFilter, 'in') . '"' . ($dirFilter === 'in' ? ' class="on"' : '')
+                 . ' title="Credentials the customer sends us">&larr; In (' . $dirCounts['in'] . ')</a>'
+                 . '<a href="' . $fLink($statusFilter, 'out') . '"' . ($dirFilter === 'out' ? ' class="on"' : '')
+                 . ' title="Secure messages we send the customer">&rarr; Out (' . $dirCounts['out'] . ')</a>'
+                 . '</span>';
     }
     $filters .= '</div>';
 
     $statusQs = $statusFilter === '' ? 'all' : $statusFilter;
-    $body = '<div class="pagehead"><h2>Requests</h2><a class="btn" href="/new">New request</a></div>'
+    $body = '<div class="pagehead"><h2>Requests</h2>'
+          . '<span class="btn-row"><a class="btn btn-ghost" href="/new-share">Send a message</a>'
+          . '<a class="btn" href="/new">New request</a></span></div>'
           . $banner . $filters;
     if (!$rows) {
         $body .= '<div class="box"><div class="empty"><strong>Nothing yet.</strong>'
@@ -319,6 +572,7 @@ if ($path === '/') {
         $body .= '<form method="post" data-confirm>'
               . '<input type="hidden" name="csrf" value="' . h(csrf_token()) . '">'
               . '<input type="hidden" name="status" value="' . h($statusQs) . '">'
+              . '<input type="hidden" name="dir" value="' . h($dirFilter) . '">'
               . '<div class="scroll"><table><thead><tr>'
               . '<th scope="col">Ticket</th><th scope="col">Needed</th><th scope="col">Status</th>'
               . '<th scope="col">Expires</th><th scope="col">Raised by</th>'
@@ -326,17 +580,25 @@ if ($path === '/') {
               . '</tr></thead><tbody>';
         foreach ($rows as $r) {
             $id = (int)$r['id'];
-            $rowCls = $r['status'] === 'submitted' ? ' class="row-ready"' : '';
-            $needFull = needs()[$r['need']] ?? $r['need'];
+            $out = is_outbound($r);
+            $href = ($out ? '/o/' : '/r/') . $id;
+            // 'submitted' cannot occur on an outbound row, but the highlight means
+            // "a credential is sitting here waiting to be read" and that is never
+            // true of something we sent.
+            $rowCls = (!$out && $r['status'] === 'submitted') ? ' class="row-ready"' : '';
+            $needFull = $out
+                ? 'Secure message sent to the customer'
+                : (needs()[$r['need']] ?? $r['need']);
             $expireBtn = $r['status'] !== 'expired'
                 ? '<button class="ico-btn expire" type="submit" name="expire_one" value="' . $id . '" data-kind="expire" aria-label="Expire">'
                   . icon_expire_svg() . '<span class="ico-name">Expire</span></button>'
                 : '<button class="ico-btn expire" type="button" disabled aria-label="Already expired">'
                   . icon_expire_svg() . '<span class="ico-name">Already expired</span></button>';
-            $body .= '<tr' . $rowCls . ' data-href="/r/' . $id . '">'
-                  . '<td><a class="rowlink" href="/r/' . $id . '">#' . h($r['ticket_id']) . '</a></td>'
-                  . '<td class="need-short" title="' . h($needFull) . '">' . h(need_short((string)$r['need'])) . '</td>'
-                  . '<td>' . status_pill($r['status']) . '</td>'
+            $body .= '<tr' . $rowCls . ' data-href="' . $href . '">'
+                  . '<td><a class="rowlink" href="' . $href . '">#' . h($r['ticket_id']) . '</a></td>'
+                  . '<td class="need-short" title="' . h($needFull) . '">'
+                  . ($out ? '&rarr; ' : '&larr; ') . h(need_short((string)$r['need'])) . '</td>'
+                  . '<td>' . status_pill($r['status'], $out) . '</td>'
                   . '<td>' . local_time((int)$r['expires_at'], 'short') . '</td>'
                   . '<td class="mut">' . h($r['requested_by']) . '</td>'
                   . '<td class="row-act">' . $expireBtn
@@ -452,11 +714,219 @@ if ($path === '/new') {
     exit;
 }
 
+if ($path === '/new-share') {
+    if ($method === 'POST') {
+        // A multipart body over post_max_size arrives with $_POST and $_FILES both
+        // EMPTY and no PHP-level error -- csrf_check() would then reject it as a
+        // forgery and the agent would be told their session was bad, not their file
+        // was too big.
+        if (!$_POST && !$_FILES && (int)($_SERVER['CONTENT_LENGTH'] ?? 0) > 0) {
+            http_response_code(413);
+            echo layout('Too large',
+                '<div class="box danger"><strong>That upload was larger than the server accepts.</strong>
+                 <p>The limit is ' . h(share_size_label(max_upload_bytes())) . ' per attachment, and the server may
+                 enforce a smaller one of its own.</p></div>
+                 <p class="btn-row"><a class="btn" href="/new-share">Start again</a></p>', $staff);
+            exit;
+        }
+        csrf_check();
+        $ticket  = trim((string)($_POST['ticket_id'] ?? ''));
+        $message = trim((string)($_POST['message'] ?? ''));
+        $view    = view_from_post();
+        $ttl     = (int)($_POST['ttl'] ?? 86400);
+        $pass    = (string)($_POST['passphrase'] ?? '');
+
+        $file    = share_file_from_upload('attachment');
+        $fileErr = is_string($file) ? $file : null;
+        if (is_string($file)) $file = null;
+
+        if ($fileErr !== null) {
+            $err = '<div class="box danger">' . h($fileErr) . '</div>';
+        } elseif (!share_fields_valid($ticket, $message, $view, $ttl, $file !== null)) {
+            $err = '<div class="box danger">A ticket number is required, and so is a message or an attachment.</div>';
+        } elseif ($pass !== '' && strlen($pass) < 6) {
+            $err = '<div class="box danger">A passphrase must be at least 6 characters, or leave it blank.</div>';
+        } else {
+            $minted = mint_share($staff, $ticket, $message, $view, $ttl, $pass === '' ? null : $pass, $file, $base);
+            echo layout('Message ready',
+                '<div class="box ok"><strong>Send this link to the customer.</strong>
+                 <p class="hint" style="margin-bottom:10px">Paste the link into the ticket. Do not paste the message itself —
+                 that is the whole point of the link.</p>
+                 ' . copyable_link($minted['url']) . '
+                 <p class="mut" style="margin-top:12px">' . h(view_label($view)) . ', expires ' . local_time($minted['expires_at']) . '.</p></div>'
+                 . ($pass !== ''
+                     ? '<div class="box warn"><strong>The passphrase is not in that link.</strong>
+                        <p>Give it to the customer some other way — say it on the call, or text it. Putting it in the same
+                        ticket reply as the link removes the only protection it was adding.</p></div>'
+                     : '') . '
+                 <p class="btn-row"><a class="btn" href="/">Back to requests</a><a class="btn btn-ghost" href="/new-share">Send another</a></p>', $staff);
+            exit;
+        }
+    }
+
+    $ttls = '';
+    foreach (ttl_choices() as $k => $v) {
+        $ttls .= '<option value="' . $k . '"' . option_selected('ttl', (string)$k, '86400') . '>' . h($v) . '</option>';
+    }
+    $views = '';
+    foreach (view_choices() as $k => $v) {
+        $views .= '<option value="' . h($k) . '"' . option_selected('view', $k, 'once') . '>' . h($v) . '</option>';
+    }
+
+    echo layout('Send a secure message', ($err ?? '') . '
+      <div class="pagehead"><h2>Send something to the customer</h2></div>
+      <div class="split">
+      <form method="post" class="card" enctype="multipart/form-data" autocomplete="off">
+        <input type="hidden" name="csrf" value="' . h(csrf_token()) . '">
+        <div class="pair">
+          <div class="field">
+            <label for="ticket_id">FreeScout ticket number</label>
+            <input id="ticket_id" name="ticket_id" required autofocus inputmode="numeric" value="' . posted_value('ticket_id') . '">
+          </div>
+          <div class="field">
+            <label for="ttl">Link expires after</label>
+            <select id="ttl" name="ttl">' . $ttls . '</select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="f-message">Message</label>
+          <textarea id="f-message" name="message" rows="8" spellcheck="false">' . posted_value('message') . '</textarea>
+          <p class="hint">Shown to the customer exactly as typed. A message, an attachment, or both.</p>
+        </div>
+        <div class="field">
+          <label for="f-file">Attachment (optional)</label>
+          <input id="f-file" name="attachment" type="file">
+          <p class="hint">Up to ' . h(share_size_label(max_upload_bytes())) . '. Encrypted at rest and destroyed with the message.</p>
+        </div>
+        <div class="pair">
+          <div class="field">
+            <label for="f-view">How long it stays openable</label>
+            <select id="f-view" name="view">' . $views . '</select>
+          </div>
+          <div class="field">
+            <label for="f-passphrase">Passphrase (optional)</label>
+            <div class="password-control">
+              <input id="f-passphrase" name="passphrase" type="password" autocomplete="new-password" spellcheck="false">'
+              . password_toggle_button() . '
+            </div>
+            <p class="hint">6 characters or more. Give it to the customer some other way.</p>
+          </div>
+        </div>
+        <p class="btn-row"><button type="submit">Generate link</button></p>
+      </form>
+      <aside class="rail">
+        <div class="box">
+          <strong>What happens next</strong>
+          <ol class="steps">
+            <li>You paste the link into the ticket</li>
+            <li>The customer clicks through and opens it</li>
+            <li>View-once is destroyed as they read it</li>
+            <li>Any attachment is purged ' . (int)round(SHARE_DOWNLOAD_GRANT / 60) . ' minutes later</li>
+          </ol>
+        </div>
+        <div class="box warn">
+          <strong>Use a passphrase for anything that matters.</strong>
+          <p>This link <em>is</em> the secret — anyone who can read the customer\'s mailbox can open it. A passphrase
+          said on a call or sent by text means an intercepted link on its own is worth nothing.</p>
+        </div>
+        <div class="box">
+          <strong>This is not the route for their credentials.</strong>
+          <p>To collect something <em>from</em> a customer, raise a <a href="/new">credential request</a> instead.
+          That path is gated on a bug reference on purpose.</p>
+        </div>
+      </aside>
+      </div>', $staff);
+    exit;
+}
+
+/**
+ * Staff view of an outbound share.
+ *
+ * Deliberately has no reveal action. The content was written by the sender and is
+ * addressed to the customer; letting any signed-in agent read it back would turn a
+ * one-time link into a copy retained on our side for its whole TTL, which is the
+ * exact property the customer is being promised it does not have.
+ */
+if (preg_match('#^/o/(\d+)$#', $path, $m)) {
+    $st = db()->prepare("SELECT * FROM requests WHERE id = ?");
+    $st->execute([(int)$m[1]]);
+    $r = $st->fetch();
+    if (!$r) { http_response_code(404); echo layout('Not found', '<div class="box danger">No such message.</div>', $staff); exit; }
+    if (!is_outbound($r)) { redirect('/r/' . (int)$r['id']); }
+
+    if ($method === 'POST') {
+        csrf_check();
+        if (isset($_POST['delete_one'])) { delete_request((int)$r['id'], $staff); redirect('/'); }
+        if (isset($_POST['expire_one'])) { expire_request((int)$r['id'], $staff); redirect('/o/' . (int)$r['id']); }
+    }
+
+    $live  = share_openable($r);
+    $link  = $base . '/v/' . $r['token'];
+    $until = local_time((int)$r['expires_at']);
+
+    $action = match (true) {
+        $r['status'] === 'expired' => '<div class="box"><strong>Expired and purged.</strong>
+            <p>The message and any attachment are gone. Send a new one if it is still needed.</p></div>',
+        $r['status'] === 'read' && view_is_once($r) => '<div class="box ok"><strong>Opened by the customer.</strong>
+            <p>Our copy was destroyed as they read it, on ' . local_time((int)$r['read_at']) . '.</p></div>',
+        $r['status'] === 'read' => '<div class="box ok"><strong>Opened by the customer</strong> on '
+            . local_time((int)$r['read_at']) . '. <p>It stays openable until ' . $until . '.</p></div>',
+        default => '<div class="box warn"><strong>Not opened yet.</strong>
+            <p>The link is live until ' . $until . '. Nobody has read it.</p></div>',
+    };
+
+    $rows = '<table class="kv"><tbody>'
+          . '<tr><th scope="row">Ticket</th><td>#' . h((string)$r['ticket_id']) . '</td></tr>'
+          . '<tr><th scope="row">Status</th><td>' . status_pill((string)$r['status'], true) . '</td></tr>'
+          . '<tr><th scope="row">Sent by</th><td>' . h((string)$r['requested_by']) . '</td></tr>'
+          . '<tr><th scope="row">Created</th><td>' . local_time((int)$r['created_at']) . '</td></tr>'
+          . '<tr><th scope="row">Expires</th><td>' . $until . '</td></tr>'
+          . '<tr><th scope="row">Opening</th><td>' . h(view_label($r)) . '</td></tr>'
+          . '<tr><th scope="row">Passphrase</th><td>'
+          . ($r['pass_hash'] !== null
+                ? 'Set' . ((int)$r['pass_fails'] > 0
+                    ? ' — ' . (int)$r['pass_fails'] . ' wrong attempt' . ((int)$r['pass_fails'] === 1 ? '' : 's')
+                    : '')
+                : 'None — the link alone opens it')
+          . '</td></tr>';
+    if ($r['file_name'] !== null) {
+        $rows .= '<tr><th scope="row">Attachment</th><td>' . h((string)$r['file_name'])
+              . ' <span class="mut">(' . h(share_size_label((int)$r['file_size'])) . ', ' . h((string)$r['file_mime']) . ')</span>'
+              . (blob_exists((string)$r['token']) ? '' : ' <span class="mut">— destroyed</span>')
+              . '</td></tr>';
+    }
+    $rows .= '</tbody></table>';
+
+    $linkBox = $live
+        ? '<div class="box"><strong>The customer link</strong>
+           <p class="hint" style="margin-bottom:10px">Paste this into the ticket. Never paste the message itself.</p>'
+           . copyable_link($link) . '</div>'
+        : '';
+
+    echo layout('Secure message',
+        '<div class="pagehead"><h2>Secure message to the customer</h2><a class="btn btn-ghost" href="/">Back</a></div>'
+        . $action . $linkBox . $rows
+        . '<div class="box"><strong>The content is not shown here.</strong>
+           <p class="mut">It was written for the customer and is not readable from this page — that is what makes
+           "view once" true rather than merely advertised. If it needs saying again, send a new message.</p></div>'
+        . '<form method="post" data-confirm class="btn-row">
+             <input type="hidden" name="csrf" value="' . h(csrf_token()) . '">'
+        . ($r['status'] !== 'expired'
+            ? '<button class="btn btn-ghost" type="submit" name="expire_one" value="' . (int)$r['id'] . '">'
+              . icon_expire_svg() . ' Destroy now</button>'
+            : '')
+        . '<button class="btn btn-ghost" type="submit" name="delete_one" value="' . (int)$r['id'] . '">'
+        . icon_delete_svg() . ' Delete record</button>
+           </form>', $staff);
+    exit;
+}
+
 if (preg_match('#^/r/(\d+)$#', $path, $m)) {
     $st = db()->prepare("SELECT * FROM requests WHERE id = ?");
     $st->execute([(int)$m[1]]);
     $r = $st->fetch();
     if (!$r) { http_response_code(404); echo layout('Not found', '<div class="box danger">No such request.</div>', $staff); exit; }
+    if (is_outbound($r)) { redirect('/o/' . (int)$r['id']); }
 
     $reveal = '';
     $revealed = false;

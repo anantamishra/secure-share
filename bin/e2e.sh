@@ -25,7 +25,8 @@ PW="$(php "$ROOT/bin/staff.php" add tester@instawp.com | sed -n 2p)"
 # PHP_CLI_SERVER_WORKERS: php -S is single-threaded by default, which silently makes
 # every concurrency assertion below vacuous -- requests would just queue and each one
 # would "win" its race alone. With workers the single-use test can actually fail.
-PHP_CLI_SERVER_WORKERS=8 php -S "127.0.0.1:$PORT" -t "$ROOT/public" "$ROOT/public/index.php" >"$TMP/srv.log" 2>&1 &
+PHPD="-d display_errors=0 -d log_errors=1 -d error_log=$TMP/php-errors.log"
+PHP_CLI_SERVER_WORKERS=8 php $PHPD -S "127.0.0.1:$PORT" -t "$ROOT/public" "$ROOT/public/index.php" >"$TMP/srv.log" 2>&1 &
 for _ in $(seq 1 15); do sleep 1; curl -sf -m 2 -o /dev/null "$B/healthz" && break; done
 
 J="$TMP/jar"
@@ -134,7 +135,7 @@ ok "api disabled token 401"     "$(code -H "Authorization: Bearer $TOK2" $B/api/
 sedi "s/^ALLOW_INFRA_CREDENTIALS=.*/ALLOW_INFRA_CREDENTIALS=1/" "$TMP/env"
 P2=$((PORT+50)); B2="http://127.0.0.1:$P2"; J2="$TMP/jar2"
 sedi "s#^APP_URL=.*#APP_URL=$B2#" "$TMP/env"
-PHP_CLI_SERVER_WORKERS=8 php -S "127.0.0.1:$P2" -t "$ROOT/public" "$ROOT/public/index.php" >"$TMP/srv2.log" 2>&1 &
+PHP_CLI_SERVER_WORKERS=8 php $PHPD -S "127.0.0.1:$P2" -t "$ROOT/public" "$ROOT/public/index.php" >"$TMP/srv2.log" 2>&1 &
 for _ in $(seq 1 15); do sleep 1; curl -sf -m 2 -o /dev/null "$B2/healthz" && break; done
 T=$(curl -s -m 20 -c "$J2" "$B2/login" | csrf)
 curl -s -m 20 -b "$J2" -c "$J2" -o /dev/null -d "csrf=$T&email=tester@instawp.com&password=$PW" "$B2/login"
@@ -254,6 +255,148 @@ done
 Tt=$(curl -s -m 20 -b "$TMP/jx" -c "$TMP/jx" "$B2/login" | csrf)
 ok "XFF cannot bypass throttle"    "$(code -b $TMP/jx -c $TMP/jx -H 'X-Forwarded-For: 10.9.77.77' -d "csrf=$Tt&email=nobody@instawp.com&password=wrong" $B2/login)" "429"
 ok "audit ip is not forgeable"     "$(sqlite3 "$DB2" "SELECT count(*) FROM audit WHERE ip LIKE '10.9.%'")" "0"
+
+# --- OUTBOUND SHARES: a link that DELIVERS a secret instead of collecting one ---
+ok "compose page needs login"      "$(code $B2/new-share)" "302"
+
+# S1 -- plain message, view once. The GET/POST split is the point: a mail gateway
+# that prefetches the link must not be able to burn the message before the customer.
+T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new-share" | csrf)
+V1=$(curl -s -m 20 -b "$J2" -F "csrf=$T" -F "ticket_id=9001" -F "message=hunter2-PLAINTEXT" -F "view=once" -F "ttl=3600" "$B2/new-share" | grep -o "$B2/v/[a-f0-9]\{48\}" | head -1)
+ok "share link issued"             "$([ -n "$V1" ] && echo yes || echo no)" "yes"
+ok "share stored as outbound"      "$(sqlite3 "$DB2" "SELECT direction FROM requests WHERE ticket_id='9001'")" "out"
+ok "share message encrypted"       "$(sqlite3 "$DB2" "SELECT count(*) FROM requests WHERE ticket_id='9001' AND ciphertext LIKE '%hunter2%'")" "0"
+ok "GET does not open the share"   "$(curl -s -m 20 "$V1" | grep -c 'Open the message')" "1"
+ok "GET leaks no plaintext"        "$(curl -s -m 20 "$V1" | grep -c 'hunter2-PLAINTEXT')" "0"
+ok "GET left it unopened"          "$(sqlite3 "$DB2" "SELECT status FROM requests WHERE ticket_id='9001'")" "pending"
+ok "POST opens the share"          "$(curl -s -m 20 -d '' "$V1" | grep -c 'hunter2-PLAINTEXT')" "1"
+ok "opened share is destroyed"     "$(sqlite3 "$DB2" "SELECT status||':'||ifnull(ciphertext,'NULL') FROM requests WHERE ticket_id='9001'")" "read:NULL"
+ok "second open refused"           "$(code -d '' $V1)" "410"
+ok "share view is audited"         "$(sqlite3 "$DB2" "SELECT count(*) FROM audit WHERE action='share.viewed'")" "1"
+
+# S2 -- passphrase gate
+T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new-share" | csrf)
+V2=$(curl -s -m 20 -b "$J2" -F "csrf=$T" -F "ticket_id=9002" -F "message=locked-SECRET" -F "view=once" -F "ttl=3600" -F "passphrase=correct-horse" "$B2/new-share" | grep -o "$B2/v/[a-f0-9]\{48\}" | head -1)
+ok "locked share asks for pass"    "$(curl -s -m 20 "$V2" | grep -c 'name="pass"')" "1"
+ok "passphrase not in the page"    "$(curl -s -m 20 "$V2" | grep -c 'correct-horse')" "0"
+ok "wrong passphrase refused"      "$(curl -s -m 20 -d 'pass=nope' "$V2" | grep -c 'not right')" "1"
+ok "wrong passphrase leaks none"   "$(curl -s -m 20 -d 'pass=nope' "$V2" | grep -c 'locked-SECRET')" "0"
+ok "right passphrase opens"        "$(curl -s -m 20 --data-urlencode 'pass=correct-horse' "$V2" | grep -c 'locked-SECRET')" "1"
+
+# S3 -- guessing costs the secret, not just time
+T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new-share" | csrf)
+V3=$(curl -s -m 20 -b "$J2" -F "csrf=$T" -F "ticket_id=9003" -F "message=burn-ME" -F "view=once" -F "ttl=3600" -F "passphrase=another-one" "$B2/new-share" | grep -o "$B2/v/[a-f0-9]\{48\}" | head -1)
+for _ in $(seq 1 5); do curl -s -m 20 -o /dev/null -d 'pass=wrong' "$V3"; done
+ok "destroyed after 5 attempts"    "$(sqlite3 "$DB2" "SELECT status||':'||ifnull(ciphertext,'NULL') FROM requests WHERE ticket_id='9003'")" "expired:NULL"
+ok "right pass too late"           "$(code --data-urlencode 'pass=another-one' $V3)" "410"
+ok "destruction is audited"        "$(sqlite3 "$DB2" "SELECT count(*) FROM audit WHERE action='share.destroyed.attempts'")" "1"
+
+# S4 -- attachment: encrypted at rest, fetched on a grant, purged with the message
+printf 'ATTACHED-FILE-BODY' > "$TMP/secret.txt"
+T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new-share" | csrf)
+V4=$(curl -s -m 20 -b "$J2" -F "csrf=$T" -F "ticket_id=9004" -F "message=see attached" -F "view=once" -F "ttl=3600" -F "attachment=@$TMP/secret.txt" "$B2/new-share" | grep -o "$B2/v/[a-f0-9]\{48\}" | head -1)
+ok "attachment recorded"           "$(sqlite3 "$DB2" "SELECT file_name FROM requests WHERE ticket_id='9004'")" "secret.txt"
+ok "attachment encrypted at rest"  "$(grep -rl 'ATTACHED-FILE-BODY' "$TMP/data/blobs" 2>/dev/null | wc -l | tr -d ' ')" "0"
+OUT4=$(curl -s -m 20 -d '' "$V4")
+D4=$(echo "$OUT4" | grep -o "$B2/v/[a-f0-9]\{48\}/f/[a-f0-9]\{48\}" | head -1)
+ok "download grant issued"         "$([ -n "$D4" ] && echo yes || echo no)" "yes"
+ok "attachment downloads"          "$(curl -s -m 20 "$D4")" "ATTACHED-FILE-BODY"
+ok "download is an attachment"     "$(curl -s -m 20 -D - -o /dev/null "$D4" | grep -ci 'content-disposition: attachment')" "1"
+ok "download is never inline type" "$(curl -s -m 20 -D - -o /dev/null "$D4" | grep -ci 'content-type: application/octet-stream')" "1"
+TOK4="${V4##*/}"
+ok "forged grant refused"          "$(code $B2/v/$TOK4/f/$(php -r 'echo str_repeat("a",48);'))" "410"
+sqlite3 "$DB2" "UPDATE requests SET dl_expires=strftime('%s','now')-10 WHERE ticket_id='9004'"
+php "$ROOT/bin/sweep.php" > /dev/null
+ok "attachment purged with grant"  "$(ls "$TMP/data/blobs" | wc -l | tr -d ' ')" "0"
+ok "expired grant refuses file"    "$(code $D4)" "410"
+
+# S5 -- the two directions must never serve each other's tokens
+TOK1="${V1##*/}"
+ok "outbound token on /s/ diverts" "$(code $B2/s/$TOK1)" "302"
+ok "inbound token on /v/ diverts"  "$(code $B2/v/${L3##*/})" "302"
+
+# S6 -- staff cannot read back what they sent; that is what makes view-once true
+T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new-share" | csrf)
+V5=$(curl -s -m 20 -b "$J2" -F "csrf=$T" -F "ticket_id=9005" -F "message=staff-MUST-NOT-SEE" -F "view=once" -F "ttl=3600" "$B2/new-share" | grep -o "$B2/v/[a-f0-9]\{48\}" | head -1)
+OID=$(sqlite3 "$DB2" "SELECT id FROM requests WHERE ticket_id='9005'")
+ok "staff detail hides content"    "$(curl -s -m 20 -b "$J2" "$B2/o/$OID" | grep -c 'staff-MUST-NOT-SEE')" "0"
+ok "staff detail has no reveal"    "$(curl -s -m 20 -b "$J2" "$B2/o/$OID" | grep -c 'action=reveal')" "0"
+ok "outbound id on /r/ diverts"    "$(code -b $J2 $B2/r/$OID)" "302"
+ok "share is still unopened"       "$(sqlite3 "$DB2" "SELECT status FROM requests WHERE id=$OID")" "pending"
+
+# S7 -- an outbound share has nothing for the CUSTOMER to rotate
+T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new-share" | csrf)
+curl -s -m 20 -o /dev/null -b "$J2" -F "csrf=$T" -F "ticket_id=9006" -F "message=x" -F "view=once" -F "ttl=3600" "$B2/new-share"
+sqlite3 "$DB2" "UPDATE requests SET expires_at=strftime('%s','now')-10 WHERE ticket_id='9006'"
+php "$ROOT/bin/sweep.php" > /dev/null
+ok "outbound expires and purges"   "$(sqlite3 "$DB2" "SELECT status FROM requests WHERE ticket_id='9006'")" "expired"
+ok "no rotation nag for outbound"  "$(sqlite3 "$DB2" "SELECT ifnull(rotation_flagged_at,'NONE') FROM requests WHERE ticket_id='9006'")" "NONE"
+
+# S8 -- 'keep' stays openable, and keeps its ciphertext to do it
+T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new-share" | csrf)
+V7=$(curl -s -m 20 -b "$J2" -F "csrf=$T" -F "ticket_id=9007" -F "message=reopen-ME" -F "view=keep" -F "ttl=3600" "$B2/new-share" | grep -o "$B2/v/[a-f0-9]\{48\}" | head -1)
+ok "keep mode first open"          "$(curl -s -m 20 -d '' "$V7" | grep -c 'reopen-ME')" "1"
+ok "keep mode second open"         "$(curl -s -m 20 -d '' "$V7" | grep -c 'reopen-ME')" "1"
+ok "keep mode kept its ciphertext" "$(sqlite3 "$DB2" "SELECT CASE WHEN ciphertext IS NULL THEN 0 ELSE 1 END FROM requests WHERE ticket_id='9007'")" "1"
+
+# The customer routes never start a session, so they never picked up PHP's session
+# cache limiter the way the staff pages did. A view-once message left in the
+# browser's on-disk cache is not destroyed, whatever our database says.
+ok "secret page is no-store"       "$(curl -s -m 20 -D - -o /dev/null -d '' "$V7" | grep -ci 'cache-control: no-store')" "1"
+ok "customer form is no-store"     "$(curl -s -m 20 -D - -o /dev/null "$L3" | grep -ci 'cache-control: no-store')" "1"
+ok "customer gets no session"      "$(curl -s -m 20 -D - -o /dev/null "$V7" | grep -ci '^set-cookie')" "0"
+
+# The copy button is rendered for the customer, so its handler must ship to the
+# customer. It used to sit inside the staff-only script block: the button reported
+# success and copied nothing, on the one page whose content cannot be fetched again.
+ok "customer copy btn has handler" "$(curl -s -m 20 -d '' "$V7" | grep -c 'querySelectorAll("\[data-copy\]")')" "1"
+ok "customer gets no staff js"     "$(curl -s -m 20 -d '' "$V7" | grep -c 'querySelectorAll("form\[data-confirm\]")')" "0"
+ok "staff keeps its own handlers"  "$(curl -s -m 20 -b "$J2" "$B2/" | grep -c 'querySelectorAll("tr\[data-href\]")')" "1"
+
+# S9 -- compose validation
+T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new-share" | csrf)
+ok "empty share refused"           "$(curl -s -m 20 -b "$J2" -F "csrf=$T" -F "ticket_id=9008" -F "message=" -F "view=once" -F "ttl=3600" "$B2/new-share" | grep -c 'so is a message or an attachment')" "1"
+T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new-share" | csrf)
+ok "short passphrase refused"      "$(curl -s -m 20 -b "$J2" -F "csrf=$T" -F "ticket_id=9008" -F "message=x" -F "view=once" -F "ttl=3600" -F "passphrase=abc" "$B2/new-share" | grep -c 'at least 6')" "1"
+ok "share csrf enforced"           "$(code -b $J2 -F 'csrf=bogus' -F 'ticket_id=9009' -F 'message=x' -F 'view=once' -F 'ttl=3600' $B2/new-share)" "400"
+ok "no share minted on refusal"    "$(sqlite3 "$DB2" "SELECT count(*) FROM requests WHERE ticket_id IN ('9008','9009')")" "0"
+
+# S10 -- staff API parity, and the separation between the two collections
+TOKA=$(php "$ROOT/bin/staff.php" token tester@instawp.com | sed -n 2p)
+SH=$(curl -s -m 20 -H "Authorization: Bearer $TOKA" -H 'Content-Type: application/json' -d '{"ticket_id":"9100","message":"api-SECRET","ttl":3600,"view":"once"}' "$B2/api/v1/shares")
+ok "api share created"             "$(echo "$SH" | grep -c '"direction":"out"')" "1"
+ok "api share returns a url"       "$(echo "$SH" | grep -c '"url"')" "1"
+ok "api share never echoes body"   "$(echo "$SH" | grep -c 'api-SECRET')" "0"
+SID=$(sqlite3 "$DB2" "SELECT id FROM requests WHERE ticket_id='9100'")
+ok "api requests exclude shares"   "$(curl -s -m 20 -H "Authorization: Bearer $TOKA" "$B2/api/v1/requests?ticket_id=9100" | grep -c '"id"')" "0"
+ok "api reveal refuses a share"    "$(code -X POST -H "Authorization: Bearer $TOKA" $B2/api/v1/requests/$SID/reveal)" "404"
+ok "api share fetch works"         "$(curl -s -m 20 -H "Authorization: Bearer $TOKA" "$B2/api/v1/shares/$SID" | grep -c '"passphrase":false')" "1"
+B64=$(printf 'B64BODY' | base64)
+SHB=$(curl -s -m 20 -H "Authorization: Bearer $TOKA" -H 'Content-Type: application/json' -d "{\"ticket_id\":\"9101\",\"message\":\"m\",\"ttl\":3600,\"attachment\":{\"name\":\"a.txt\",\"content_b64\":\"$B64\"}}" "$B2/api/v1/shares")
+ok "api share takes a b64 file"    "$(echo "$SHB" | grep -c '"name":"a.txt"')" "1"
+# Over OUR limit but inside the server's: the app rejects it with a JSON 400.
+php -r '$b = base64_encode(str_repeat("x", 5.5*1048576)); file_put_contents("'"$TMP"'/big.json", json_encode(["ticket_id"=>"9102","ttl"=>3600,"attachment"=>["name"=>"big.bin","content_b64"=>$b]]));'
+BLOBS=$(ls "$TMP/data/blobs" 2>/dev/null | wc -l | tr -d ' ')
+ok "api rejects oversize b64"      "$(code -H "Authorization: Bearer $TOKA" -H 'Content-Type: application/json' --data-binary @"$TMP/big.json" $B2/api/v1/shares)" "400"
+ok "oversize left no row"          "$(sqlite3 "$DB2" "SELECT count(*) FROM requests WHERE ticket_id='9102'")" "0"
+ok "oversize wrote no blob"        "$(ls "$TMP/data/blobs" 2>/dev/null | wc -l | tr -d ' ')" "$BLOBS"
+# Over the SERVER's limit: PHP discards the body before we run, so the route never
+# sees it. Answering 200-with-a-PHP-warning is what this asserts against.
+php -r '$b = base64_encode(str_repeat("x", 9*1048576)); file_put_contents("'"$TMP"'/huge.json", json_encode(["ticket_id"=>"9103","ttl"=>3600,"attachment"=>["name"=>"huge.bin","content_b64"=>$b]]));'
+HUGE=$(curl -s -m 30 -H "Authorization: Bearer $TOKA" -H 'Content-Type: application/json' --data-binary @"$TMP/huge.json" "$B2/api/v1/shares")
+ok "api 413s over post_max_size"   "$(code -H "Authorization: Bearer $TOKA" -H 'Content-Type: application/json' --data-binary @"$TMP/huge.json" $B2/api/v1/shares)" "413"
+ok "413 is json, not a warning"    "$(echo "$HUGE" | grep -c '"code":"too_large"')" "1"
+ok "413 leaked no php warning"     "$(echo "$HUGE" | grep -ci 'content-length of')" "0"
+ok "api share delete expires it"   "$(code -X DELETE -H "Authorization: Bearer $TOKA" $B2/api/v1/shares/$SID)" "200"
+ok "deleted share is dead"         "$(sqlite3 "$DB2" "SELECT status FROM requests WHERE id=$SID")" "expired"
+
+
+# --- VERSION: one source of truth, and not handed to anonymous callers ---
+VSRC=$(php -r 'require "'"$ROOT"'/src/bootstrap.php"; echo APP_VERSION;')
+ok "version is semver"             "$(printf '%s' "$VSRC" | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+$')" "1"
+ok "api me reports the version"    "$(curl -s -m 20 -H "Authorization: Bearer $TOKA" $B2/api/v1/me | grep -c "\"version\":\"$VSRC\"")" "1"
+ok "healthz hides the version"     "$(curl -s -m 20 $B2/healthz | grep -c "$VSRC")" "0"
+ok "changelog documents it"        "$(grep -c "^## $VSRC\$" "$ROOT/CHANGELOG.md")" "1"
 
 sedi "s/^APP_KEY=.*/APP_KEY=$(php -r 'echo bin2hex(random_bytes(32));')/" "$TMP/env"
 ok "wrong key -> loud failure"  "$(php -r 'require "'"$ROOT"'/src/bootstrap.php"; env_load(getenv("APP_ENV_FILE")); require "'"$ROOT"'/src/crypto.php"; try { unseal(base64_encode(random_bytes(24)), base64_encode(random_bytes(60))); echo "silent"; } catch (Throwable $e) { echo "threw"; }')" "threw"

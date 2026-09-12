@@ -56,6 +56,35 @@ function unseal(string $nonceB64, string $ciphertextB64): string {
     return $pt;
 }
 
+/**
+ * Same construction as seal()/unseal(), but raw bytes in and out.
+ *
+ * Share attachments go to a file, not a TEXT column, so the base64 that seal()
+ * applies to survive PDO would cost a third of the size for nothing. Layout is
+ * nonce || ciphertext, which is why unseal_raw() can split it back apart.
+ */
+function seal_raw(string $plaintext): string {
+    $key   = master_key();
+    $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
+    $ct    = sodium_crypto_secretbox($plaintext, $nonce, $key);
+    sodium_memzero($key);
+    return $nonce . $ct;
+}
+
+function unseal_raw(string $blob): string {
+    $nb = SODIUM_CRYPTO_SECRETBOX_NONCEBYTES;
+    if (strlen($blob) <= $nb) {
+        throw new RuntimeException('Stored attachment is malformed.');
+    }
+    $key = master_key();
+    $pt  = sodium_crypto_secretbox_open(substr($blob, $nb), substr($blob, 0, $nb), $key);
+    sodium_memzero($key);
+    if ($pt === false) {
+        throw new RuntimeException('Decryption failed. APP_KEY may have changed since this was stored.');
+    }
+    return $pt;
+}
+
 function new_token(): string {
     return bin2hex(random_bytes(24));
 }

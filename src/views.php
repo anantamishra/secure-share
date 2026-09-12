@@ -8,7 +8,7 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
     $audience = $opt['audience'] ?? ($staff !== null ? 'staff' : 'guest');
     $here = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
     $on = function (string $href) use ($here): string {
-        $active = $here === $href || ($href === '/' && (bool)preg_match('#^/r/\d+$#', $here));
+        $active = $here === $href || ($href === '/' && (bool)preg_match('#^/[ro]/\d+$#', $here));
         return $active ? ' class="on" aria-current="page"' : '';
     };
 
@@ -24,6 +24,7 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
       <nav aria-label="Staff">
         <a href="/"' . $on('/') . '>Requests</a>
         <a href="/new"' . $on('/new') . '>New request</a>
+        <a href="/new-share"' . $on('/new-share') . '>Send message</a>
         <a href="/audit"' . $on('/audit') . '>Audit</a>
         <a href="/settings"' . $settingsOn . '>Settings</a>
       </nav>
@@ -63,7 +64,7 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
     $foot = match ($audience) {
         'customer' => '<footer class="foot">Encrypted in transit and at rest · You choose how long we keep them</footer>',
         'guest'    => '<footer class="foot">Staff only · Customer links do not use this page</footer>',
-        default    => '',
+        default    => '<footer class="foot">Internal tool · v' . APP_VERSION . '</footer>',
     };
 
     return '<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -315,6 +316,15 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
         border:1px solid var(--line);background:var(--panel)}
   .filters a:hover{background:var(--mint-soft);color:var(--brand);border-color:transparent}
   .filters a.on{background:var(--btn);color:var(--btn-fg);border-color:var(--btn)}
+  /* Direction lives in the same row as status: a second row of pills was more
+     chrome than the table it was filtering. margin-left:auto parks it on the right;
+     it wraps underneath on narrow screens rather than squeezing the status chips. */
+  .filters .seg{display:inline-flex;margin-left:auto;border:1px solid var(--line);
+        border-radius:99px;background:var(--panel);overflow:hidden}
+  .filters .seg a{border:0;border-radius:0;background:transparent;padding:6px 11px}
+  .filters .seg a + a{border-left:1px solid var(--line)}
+  .filters .seg a:hover{background:var(--mint-soft);color:var(--brand)}
+  .filters .seg a.on{background:var(--btn);color:var(--btn-fg)}
   .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:16px 0 0}
   .pager .btn-row{margin:0}
   .pager .off{opacity:.4;pointer-events:none}
@@ -337,6 +347,7 @@ function layout(string $title, string $body, ?string $staff = null, array $opt =
     .who{display:none}
   }
   @media (max-width:640px){
+    .filters .seg{margin-left:0}
     .meta{grid-template-columns:1fr}
     .meta dt{border-bottom:0;padding-bottom:0}
     nav{width:100%}
@@ -383,6 +394,25 @@ document.querySelectorAll(".password-toggle").forEach(function(btn){
     btn.setAttribute("aria-label",shown?"Show password":"Hide password");
   });
 });
+// Ungated on purpose: copy_button() is rendered on the CUSTOMER share page too.
+// Gating this with the staff-only handlers left that button inert — it told a
+// customer their view-once message was copied and copied nothing, on the one
+// page whose content cannot be fetched again.
+document.querySelectorAll("[data-copy]").forEach(function(btn){
+  btn.addEventListener("click",function(){
+    var el=document.querySelector(btn.getAttribute("data-copy"));
+    if(!el)return;
+    var text=el.value||el.textContent||"";
+    function done(){
+      btn.classList.add("copied");
+      btn.setAttribute("aria-label","Copied");
+      setTimeout(function(){btn.classList.remove("copied");btn.setAttribute("aria-label","Copy")},1600);
+    }
+    function fallback(){if(el.select){el.focus();el.select()}try{document.execCommand("copy");done()}catch(e){}}
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(fallback)}
+    else fallback();
+  });
+});
 ' . ($staff === null ? '' : '
 document.querySelectorAll("form[data-confirm]").forEach(function(f){
   f.addEventListener("submit",function(e){
@@ -410,21 +440,6 @@ document.querySelectorAll("tr[data-href]").forEach(function(tr){
     location.href=url;
   });
 });
-document.querySelectorAll("[data-copy]").forEach(function(btn){
-  btn.addEventListener("click",function(){
-    var el=document.querySelector(btn.getAttribute("data-copy"));
-    if(!el)return;
-    var text=el.value||el.textContent||"";
-    function done(){
-      btn.classList.add("copied");
-      btn.setAttribute("aria-label","Copied");
-      setTimeout(function(){btn.classList.remove("copied");btn.setAttribute("aria-label","Copy")},1600);
-    }
-    function fallback(){if(el.select){el.focus();el.select()}try{document.execCommand("copy");done()}catch(e){}}
-    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(fallback)}
-    else fallback();
-  });
-});
 ') . '</script></body></html>';
 }
 
@@ -442,6 +457,14 @@ function audit_label(string $action): string {
         'credential.reread'         => 'Credential opened again',
         'credential.read.lost_race' => 'Someone else opened it first',
         'credential.read.failed'    => 'Could not decrypt',
+        'share.created'             => 'Secure message sent',
+        'share.viewed'              => 'Customer opened the message',
+        'share.view.lost_race'      => 'Message was already opened',
+        'share.view.failed'         => 'Message could not be decrypted',
+        'share.unlock.failed'       => 'Wrong passphrase',
+        'share.destroyed.attempts'  => 'Destroyed after wrong passphrases',
+        'share.file.downloaded'     => 'Attachment downloaded',
+        'share.file.purged'         => 'Attachment purged',
         'request.created'           => 'Request created',
         'request.deleted'           => 'Request deleted',
         'request.expired'           => 'Request expired',
@@ -480,6 +503,12 @@ function audit_detail_label(string $action, ?string $detail): string {
         ];
         return $was[$m[1]] ?? ('Was ' . $m[1]);
     }
+    if ($action === 'share.created' && preg_match('/^view=(\S+) ttl=(\d+)s pass=(\S+) file=(\S+)$/', $detail, $m)) {
+        return view_label($m[1])
+            . ' · link lasts ' . (ttl_choices()[(int)$m[2]] ?? ($m[2] . ' seconds'))
+            . ' · ' . ($m[3] === 'yes' ? 'passphrase set' : 'no passphrase')
+            . ' · ' . ($m[4] === 'yes' ? 'with attachment' : 'no attachment');
+    }
     if ($action === 'request.created' && preg_match('/^need=(\S+) ttl=(\d+)s bug=(.*)$/s', $detail, $m)) {
         $need = needs()[$m[1]] ?? $m[1];
         $ttl  = ttl_choices()[(int)$m[2]] ?? ($m[2] . ' seconds');
@@ -507,13 +536,26 @@ function audit_detail_label(string $action, ?string $detail): string {
     return $detail;
 }
 
-function status_pill(string $status): string {
-    $map = [
-        'pending'   => ['awaiting customer', 'pending'],
-        'submitted' => ['ready to read', 'ready'],
-        'read'      => ['read &amp; destroyed', 'done'],
-        'expired'   => ['expired &amp; purged', 'dead'],
-    ];
+/**
+ * The same four statuses mean opposite things in each direction: 'pending' on an
+ * inbound request is us waiting on the customer, on an outbound share it is the
+ * customer not having opened it yet. One vocabulary for both read as nonsense on
+ * half the dashboard.
+ */
+function status_pill(string $status, bool $outbound = false): string {
+    $map = $outbound
+        ? [
+            'pending'   => ['not opened yet', 'pending'],
+            'submitted' => ['not opened yet', 'pending'],
+            'read'      => ['opened by customer', 'done'],
+            'expired'   => ['expired &amp; purged', 'dead'],
+        ]
+        : [
+            'pending'   => ['awaiting customer', 'pending'],
+            'submitted' => ['ready to read', 'ready'],
+            'read'      => ['read &amp; destroyed', 'done'],
+            'expired'   => ['expired &amp; purged', 'dead'],
+        ];
     [$label, $cls] = $map[$status] ?? [h($status), 'dead'];
     return '<span class="pill ' . $cls . '">' . $label . '</span>';
 }
@@ -619,6 +661,7 @@ function need_short(string $need): string {
         'wp_admin'        => 'WP admin',
         'wp_app_password' => 'App password',
         'ssh'             => 'SSH / SFTP',
+        'message'         => 'Secure message',
         default           => $need,
     };
 }

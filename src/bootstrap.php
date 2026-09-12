@@ -10,6 +10,19 @@ declare(strict_types=1);
  */
 
 /**
+ * The application version, and the only place it is written down.
+ *
+ * Semver against the HTTP surface staff and the API depend on: a new endpoint or a
+ * new capability is a minor, a change that breaks an existing caller is a major.
+ * Bump it in the same commit as the change it describes — a version bumped later,
+ * on its own, tells you a release happened but not which code it covers.
+ *
+ * `freescout-module/SecureHandoff/module.json` carries its own version and moves
+ * independently: it is installed into somebody else's FreeScout on its own schedule.
+ */
+const APP_VERSION = '1.1.0';
+
+/**
  * What the form is allowed to collect.
  *
  * WordPress options are always available: a temporary admin account and an
@@ -98,6 +111,71 @@ function share_label(array|string $r): string {
     return share_choices()[$key] ?? 'View once';
 }
 
+/**
+ * How long an OUTBOUND share stays openable, reusing the same `share` column.
+ *
+ * Deliberately not merged into share_choices(): that list is rendered as the
+ * customer's radio group on the inbound form, and 'keep' has no meaning there.
+ */
+function view_choices(): array {
+    return [
+        'once' => 'View once, then destroy',
+        'keep' => 'Can be re-opened until it expires',
+    ];
+}
+
+function view_is_once(array $r): bool {
+    return (($r['share'] ?? 'once') !== 'keep');
+}
+
+function view_label(array|string $r): string {
+    $key = is_array($r) ? (string)($r['share'] ?? 'once') : $r;
+    return view_choices()[$key] ?? 'View once, then destroy';
+}
+
+/** Outbound = we are sending the secret. Inbound = the customer is. */
+function is_outbound(array $r): bool {
+    return (string)($r['direction'] ?? 'in') === 'out';
+}
+
+/** Ceiling for a share attachment. php.ini may impose a lower one of its own. */
+/** Parse a php.ini shorthand size ("8M", "512K") into bytes. */
+function ini_bytes(string $key): int {
+    $v = trim((string)ini_get($key));
+    if ($v === '') return 0;
+    $n = (int)$v;
+    return match (strtolower(substr($v, -1))) {
+        'g'     => $n * 1073741824,
+        'm'     => $n * 1048576,
+        'k'     => $n * 1024,
+        default => $n,
+    };
+}
+
+/**
+ * True when PHP threw the body away before we ran.
+ *
+ * A POST over post_max_size never reaches userland: $_POST, $_FILES and
+ * php://input are all EMPTY and no error is raised that we can catch. Without
+ * this check the request falls through to whatever the route does with empty
+ * input — on the API that was a 200 with a PHP warning in place of the JSON, and
+ * on the web form it was a CSRF failure telling the agent their session was bad
+ * when the truth was that their attachment was too big.
+ */
+function post_exceeded_limit(): bool {
+    if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') return false;
+    $max = ini_bytes('post_max_size');
+    if ($max <= 0) return false;
+    return (int)($_SERVER['CONTENT_LENGTH'] ?? 0) > $max;
+}
+
+function max_upload_bytes(): int {
+    $mb = (int)cfg('MAX_UPLOAD_MB', '5');
+    if ($mb < 1)   $mb = 1;
+    if ($mb > 100) $mb = 100;
+    return $mb * 1048576;
+}
+
 /** Shared list sort: ready first, then awaiting, then read, then expired. */
 function requests_list_order_sql(int $limit = 100): string {
     return " ORDER BY CASE status WHEN 'submitted' THEN 0 WHEN 'pending' THEN 1 WHEN 'read' THEN 2 ELSE 3 END, created_at DESC LIMIT $limit";
@@ -124,6 +202,64 @@ function data_dir(): string {
     $d = cfg('DATA_DIR', '/home/instapod/handoff-data');
     if (!is_dir($d)) mkdir($d, 0700, true);
     return $d;
+}
+
+/**
+ * Encrypted share attachments live on disk, not in SQLite.
+ *
+ * A 5 MB attachment inlined as a BLOB is a 5 MB row that WAL has to copy on every
+ * checkpoint, in a database whose other rows are a few hundred bytes. On disk the
+ * bytes are also destroyed by an unlink() we can see succeed, rather than by a
+ * DELETE that leaves the pages readable until SQLite happens to reuse them.
+ *
+ * The file is named for the request token and nothing else, so there is no path
+ * derived from anything a customer supplies.
+ */
+function blob_dir(): string {
+    $d = data_dir() . '/blobs';
+    if (!is_dir($d)) mkdir($d, 0700, true);
+    return $d;
+}
+
+function blob_path(string $token): ?string {
+    if (!preg_match('/^[a-f0-9]{48}$/', $token)) return null;
+    return blob_dir() . '/' . $token . '.bin';
+}
+
+function blob_put(string $token, string $bytes): void {
+    $p = blob_path($token);
+    if ($p === null) throw new RuntimeException('Refusing to write a blob for a malformed token.');
+    // Write-then-rename: a half-written attachment is never visible under the real
+    // name, so a crash mid-upload cannot produce a blob that fails to decrypt.
+    $tmp = $p . '.part';
+    if (file_put_contents($tmp, $bytes, LOCK_EX) === false) {
+        throw new RuntimeException('Could not store the attachment.');
+    }
+    @chmod($tmp, 0600);
+    if (!rename($tmp, $p)) {
+        @unlink($tmp);
+        throw new RuntimeException('Could not store the attachment.');
+    }
+}
+
+function blob_exists(string $token): bool {
+    $p = blob_path($token);
+    return $p !== null && is_file($p);
+}
+
+function blob_get(string $token): ?string {
+    $p = blob_path($token);
+    if ($p === null || !is_file($p)) return null;
+    $b = file_get_contents($p);
+    return $b === false ? null : $b;
+}
+
+/** Safe to call for any row: inbound requests simply have no blob to unlink. */
+function blob_delete(string $token): void {
+    $p = blob_path($token);
+    if ($p === null) return;
+    @unlink($p);
+    @unlink($p . '.part');
 }
 
 function db(): PDO {
@@ -199,6 +335,21 @@ function migrate(PDO $pdo): void {
     if (!in_array('share', $reqCols, true)) {
         $pdo->exec("ALTER TABLE requests ADD COLUMN share TEXT NOT NULL DEFAULT 'once'");
     }
+    // Outbound shares. The default on `direction` is what makes every pre-existing
+    // row an inbound request without a data migration.
+    foreach ([
+        'direction'  => "direction TEXT NOT NULL DEFAULT 'in'",
+        'pass_hash'  => 'pass_hash TEXT',
+        'pass_fails' => 'pass_fails INTEGER NOT NULL DEFAULT 0',
+        'file_name'  => 'file_name TEXT',
+        'file_size'  => 'file_size INTEGER',
+        'file_mime'  => 'file_mime TEXT',
+        'dl_token'   => 'dl_token TEXT',
+        'dl_expires' => 'dl_expires INTEGER',
+    ] as $col => $ddl) {
+        if (!in_array($col, $reqCols, true)) $pdo->exec("ALTER TABLE requests ADD COLUMN $ddl");
+    }
+    $pdo->exec("CREATE INDEX IF NOT EXISTS idx_req_direction ON requests(direction, status)");
 }
 
 function audit(string $actor, string $action, ?int $reqId = null, ?string $ticket = null, ?string $detail = null): void {
