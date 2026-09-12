@@ -339,6 +339,13 @@ ok "keep mode first open"          "$(curl -s -m 20 -d '' "$V7" | grep -c 'reope
 ok "keep mode second open"         "$(curl -s -m 20 -d '' "$V7" | grep -c 'reopen-ME')" "1"
 ok "keep mode kept its ciphertext" "$(sqlite3 "$DB2" "SELECT CASE WHEN ciphertext IS NULL THEN 0 ELSE 1 END FROM requests WHERE ticket_id='9007'")" "1"
 
+# The customer routes never start a session, so they never picked up PHP's session
+# cache limiter the way the staff pages did. A view-once message left in the
+# browser's on-disk cache is not destroyed, whatever our database says.
+ok "secret page is no-store"       "$(curl -s -m 20 -D - -o /dev/null -d '' "$V7" | grep -ci 'cache-control: no-store')" "1"
+ok "customer form is no-store"     "$(curl -s -m 20 -D - -o /dev/null "$L3" | grep -ci 'cache-control: no-store')" "1"
+ok "customer gets no session"      "$(curl -s -m 20 -D - -o /dev/null "$V7" | grep -ci '^set-cookie')" "0"
+
 # S9 -- compose validation
 T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new-share" | csrf)
 ok "empty share refused"           "$(curl -s -m 20 -b "$J2" -F "csrf=$T" -F "ticket_id=9008" -F "message=" -F "view=once" -F "ttl=3600" "$B2/new-share" | grep -c 'so is a message or an attachment')" "1"

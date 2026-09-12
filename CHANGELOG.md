@@ -32,6 +32,13 @@ Outbound shares: the app now runs in both directions.
   customer's side to rotate.
 
 ### Fixed
+- Every response now carries `Cache-Control: no-store`. The staff pages had been
+  getting cache headers by accident — `current_staff()` starts a session and PHP's
+  `session_cache_limiter` emits them on the way out — while the customer routes,
+  which never start a session, shipped with none at all. That included the `/v/`
+  response rendering the decrypted message, so a view-once share was destroyed in our
+  database but still sat in the customer's on-disk browser cache, re-renderable with
+  the back button and retainable by a TLS-terminating proxy on their side.
 - A request body over `post_max_size` is discarded by PHP before any of this code
   runs, with `$_POST`, `$_FILES` and `php://input` all empty and no catchable error.
   The API answered 200 with a PHP warning in place of the JSON, and the web form

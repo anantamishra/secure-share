@@ -45,7 +45,7 @@ same key, same burn-on-read; `direction` is the only thing that separates them.
     freescout-module/  drop-in FreeScout module (in-ticket mint button)
     bin/staff.php      add/disable/list/token/revoke-token staff
     bin/sweep.php      cron: purge expired, fire rotation nags
-    bin/e2e.sh         136 end-to-end assertions
+    bin/e2e.sh         139 end-to-end assertions
     CHANGELOG.md       what changed, per version
 
 ## Config — `/home/instapod/handoff.env` (chmod 600, OUTSIDE the checkout)
@@ -207,7 +207,7 @@ upload inside FreeScout's request cycle — a separate piece of work, not done h
 
     bash bin/e2e.sh 8799
 
-136 assertions covering auth, CSRF, the Tier-1 gate, the field allowlist, single-use links,
+139 assertions covering auth, CSRF, the Tier-1 gate, the field allowlist, single-use links,
 burn-on-read, expiry purge, the rotation nag, audit rows, and that a wrong `APP_KEY` fails loudly
 rather than silently.
 

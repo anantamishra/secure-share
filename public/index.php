@@ -34,6 +34,25 @@ set_exception_handler(function (Throwable $e): void {
 header('X-Frame-Options: DENY');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: no-referrer');
+/**
+ * No-store on EVERY response, not just the ones that happen to touch a session.
+ *
+ * Staff pages were getting these headers by accident: current_staff() starts a
+ * session, and PHP's session_cache_limiter emits no-store on its way out. The
+ * customer routes never start a session, so /s/ and /v/ shipped with no cache
+ * headers at all -- including the /v/ response that renders the decrypted message.
+ *
+ * That made the destruction we promise partly untrue. A view-once share was gone
+ * from our database but still in the customer's on-disk browser cache, re-renderable
+ * with the back button after the page said it had been destroyed, and retainable by
+ * any TLS-terminating proxy on their side. public/ serves nothing but this front
+ * controller -- no static assets -- so there is nothing here that wants caching.
+ * Routes that set their own Cache-Control (the API, the attachment download) still
+ * override this, because header() replaces by default.
+ */
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+header('Expires: 0');
 header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-" . csp_nonce() . "'; form-action 'self'; frame-ancestors 'none'");
 
 $path   = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
