@@ -394,6 +394,25 @@ document.querySelectorAll(".password-toggle").forEach(function(btn){
     btn.setAttribute("aria-label",shown?"Show password":"Hide password");
   });
 });
+// Ungated on purpose: copy_button() is rendered on the CUSTOMER share page too.
+// Gating this with the staff-only handlers left that button inert — it told a
+// customer their view-once message was copied and copied nothing, on the one
+// page whose content cannot be fetched again.
+document.querySelectorAll("[data-copy]").forEach(function(btn){
+  btn.addEventListener("click",function(){
+    var el=document.querySelector(btn.getAttribute("data-copy"));
+    if(!el)return;
+    var text=el.value||el.textContent||"";
+    function done(){
+      btn.classList.add("copied");
+      btn.setAttribute("aria-label","Copied");
+      setTimeout(function(){btn.classList.remove("copied");btn.setAttribute("aria-label","Copy")},1600);
+    }
+    function fallback(){if(el.select){el.focus();el.select()}try{document.execCommand("copy");done()}catch(e){}}
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(fallback)}
+    else fallback();
+  });
+});
 ' . ($staff === null ? '' : '
 document.querySelectorAll("form[data-confirm]").forEach(function(f){
   f.addEventListener("submit",function(e){
@@ -419,21 +438,6 @@ document.querySelectorAll("tr[data-href]").forEach(function(tr){
     var url=tr.getAttribute("data-href");
     if(e.metaKey||e.ctrlKey||e.shiftKey){window.open(url,"_blank","noopener");return}
     location.href=url;
-  });
-});
-document.querySelectorAll("[data-copy]").forEach(function(btn){
-  btn.addEventListener("click",function(){
-    var el=document.querySelector(btn.getAttribute("data-copy"));
-    if(!el)return;
-    var text=el.value||el.textContent||"";
-    function done(){
-      btn.classList.add("copied");
-      btn.setAttribute("aria-label","Copied");
-      setTimeout(function(){btn.classList.remove("copied");btn.setAttribute("aria-label","Copy")},1600);
-    }
-    function fallback(){if(el.select){el.focus();el.select()}try{document.execCommand("copy");done()}catch(e){}}
-    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(fallback)}
-    else fallback();
   });
 });
 ') . '</script></body></html>';

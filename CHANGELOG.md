@@ -39,6 +39,10 @@ Outbound shares: the app now runs in both directions.
   response rendering the decrypted message, so a view-once share was destroyed in our
   database but still sat in the customer's on-disk browser cache, re-renderable with
   the back button and retainable by a TLS-terminating proxy on their side.
+- The customer's copy button works. `copy_button()` is rendered on the share view, but
+  its click handler was emitted only inside the staff-only script block — so it
+  reported success and copied nothing, on the one page whose content cannot be
+  fetched again.
 - A request body over `post_max_size` is discarded by PHP before any of this code
   runs, with `$_POST`, `$_FILES` and `php://input` all empty and no catchable error.
   The API answered 200 with a PHP warning in place of the JSON, and the web form

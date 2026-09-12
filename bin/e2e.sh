@@ -346,6 +346,13 @@ ok "secret page is no-store"       "$(curl -s -m 20 -D - -o /dev/null -d '' "$V7
 ok "customer form is no-store"     "$(curl -s -m 20 -D - -o /dev/null "$L3" | grep -ci 'cache-control: no-store')" "1"
 ok "customer gets no session"      "$(curl -s -m 20 -D - -o /dev/null "$V7" | grep -ci '^set-cookie')" "0"
 
+# The copy button is rendered for the customer, so its handler must ship to the
+# customer. It used to sit inside the staff-only script block: the button reported
+# success and copied nothing, on the one page whose content cannot be fetched again.
+ok "customer copy btn has handler" "$(curl -s -m 20 -d '' "$V7" | grep -c 'querySelectorAll("\[data-copy\]")')" "1"
+ok "customer gets no staff js"     "$(curl -s -m 20 -d '' "$V7" | grep -c 'querySelectorAll("form\[data-confirm\]")')" "0"
+ok "staff keeps its own handlers"  "$(curl -s -m 20 -b "$J2" "$B2/" | grep -c 'querySelectorAll("tr\[data-href\]")')" "1"
+
 # S9 -- compose validation
 T=$(curl -s -m 20 -b "$J2" -c "$J2" "$B2/new-share" | csrf)
 ok "empty share refused"           "$(curl -s -m 20 -b "$J2" -F "csrf=$T" -F "ticket_id=9008" -F "message=" -F "view=once" -F "ttl=3600" "$B2/new-share" | grep -c 'so is a message or an attachment')" "1"
